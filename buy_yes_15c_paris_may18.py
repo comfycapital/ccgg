@@ -167,6 +167,13 @@ def build_api_creds() -> Optional[ApiCreds]:
     return None
 
 
+def get_or_create_api_creds(client: ClobClient) -> ApiCreds:
+    try:
+        return client.derive_api_key()
+    except Exception:
+        return client.create_api_key()
+
+
 def build_client() -> ClobClient:
     private_key = get_required_env(PRIVATE_KEY_ENV)
     api_creds = build_api_creds()
@@ -186,7 +193,7 @@ def build_client() -> ClobClient:
     )
 
     if api_creds is None:
-        client.set_api_creds(client.create_or_derive_api_key())
+        client.set_api_creds(get_or_create_api_creds(client))
 
     return client
 
