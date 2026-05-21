@@ -1,136 +1,3 @@
-def build_temperature_markets(
-    event: dict[str, Any],
-    logger: logging.Logger,
-) -> list[TemperatureMarket]:
-    markets = event.get("markets")
-
-    if not isinstance(markets, list):
-        raise ValueError("Target event does not contain a markets list.")
-
-    temperature_markets = []
-
-    for market in markets:
-        if not isinstance(market, dict) or not is_tradeable_market(market):
-            continue
-
-        try:
-            temperature_markets.append(build_temperature_market(market))
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            log_json(
-                logger,
-                "market_skipped",
-                {
-                    "error": str(error),
-                    "market_id": market.get("id"),
-                    "question": market.get("question"),
-                },
-            )
-
-    return sorted(temperature_markets, key=lambda item: item.temperature_celsius)
-
-
-def load_market_snapshot(target_date: str, logger: logging.Logger) -> MarketSnapshot:
-    events = get_gamma_events(target_date)
-    event = select_target_event(events, target_date)
-    markets = build_temperature_markets(event, logger)
-
-    if not markets:
-        raise ValueError(f"No tradeable temperature markets found for event {event.get('id')}.")
-
-    log_json(
-        logger,
-        "markets_loaded",
-        {
-            "event_id": event.get("id"),
-            "market_count": len(markets),
-            "market_ids": [market.market_id for market in markets],
-            "target_date": target_date,
-            "title": event.get("title"),
-        },
-    )
-    return MarketSnapshot(target_date=target_date, event=event, markets=markets)
-
-
-def parse_numeric_price(value: Any) -> Optional[float]:
-    if isinstance(value, bool):
-        return None
-
-    if isinstance(value, (int, float)):
-        return normalize_probability_value(float(value))
-
-    if isinstance(value, str):
-        text = value.strip()
-
-        if not text:
-            return None
-
-        return normalize_probability_value(float(text))
-
-    return None
-
-
-def parse_price_payload(value: Any) -> Optional[float]:
-    direct_price = parse_numeric_price(value)
-
-    if direct_price is not None:
-        return direct_price
-
-    if not isinstance(value, dict):
-        return None
-
-    for price_key in PRICE_RESPONSE_VALUE_KEYS:
-        if price_key not in value:
-            continue
-
-        price = parse_numeric_price(value.get(price_key))
-
-        if price is not None:
-            return price
-
-    return None
-
-
-def get_first_mapping_value(source: dict[str, Any], keys: tuple[str, ...]) -> Optional[Any]:
-    for key in keys:
-        if key in source:
-            return source.get(key)
-
-    return None
-
-
-def extract_prices_from_entries(
-    entries: list[Any],
-    requested_token_ids: set[str],
-) -> dict[str, float]:
-    prices: dict[str, float] = {}
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-
-        token_id = get_first_mapping_value(entry, PRICE_RESPONSE_TOKEN_KEYS)
-
-        if token_id is None:
-            continue
-
-        token_id_text = str(token_id)
-
-        if token_id_text not in requested_token_ids:
-            continue
-
-        side = get_first_mapping_value(entry, PRICE_RESPONSE_SIDE_KEYS)
-
-        if side is not None and str(side).upper() != BUY_SIDE:
-            continue
-
-        price = parse_price_payload(entry)
-
-        if price is not None:
-            prices[token_id_text] = price
-
-    return prices
-
-
 def extract_prices_from_keyed_dict(
     response_json: dict[str, Any],
     requested_token_ids: set[str],
@@ -293,6 +160,35 @@ def log_order_skipped_price_above_max(
     )
 
 
+def log_order_skipped_trigger_above_max(
+    logger: logging.Logger,
+    snapshot: MarketSnapshot,
+    market: TemperatureMarket,
+    trigger_price: float,
+    buy_amount_usdc: float,
+    max_buy_price: float,
+) -> None:
+    log_json(
+        logger,
+        "order_skipped_trigger_above_max",
+        {
+            "amount_usdc": buy_amount_usdc,
+            "condition_id": market.condition_id,
+            "event_id": snapshot.event.get("id"),
+            "event_title": snapshot.event.get("title"),
+            "market_id": market.market_id,
+            "market_order_type": MARKET_ORDER_TYPE,
+            "max_buy_price": max_buy_price,
+            "question": market.question,
+            "side": BUY_SIDE,
+            "target_date": snapshot.target_date,
+            "temperature_celsius": market.temperature_celsius,
+            "trigger_price": trigger_price,
+            "yes_token_id": market.yes_token_id,
+        },
+    )
+
+
 def calculate_required_market_price(
     client: ClobClient,
     market: TemperatureMarket,
@@ -329,6 +225,17 @@ def buy_yes_market(
     buy_amount_usdc: float,
     max_buy_price: float,
 ) -> Optional[dict[str, Any]]:
+    if trigger_price > max_buy_price:
+        log_order_skipped_trigger_above_max(
+            logger=logger,
+            snapshot=snapshot,
+            market=market,
+            trigger_price=trigger_price,
+            buy_amount_usdc=buy_amount_usdc,
+            max_buy_price=max_buy_price,
+        )
+        return None
+
     try:
         required_price = calculate_required_market_price(client, market, buy_amount_usdc)
     except Exception as error:
