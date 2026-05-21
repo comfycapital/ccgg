@@ -575,3 +575,4 @@ def extract_prices_from_entries(
             prices[token_id_text] = price
 
     return prices
+
