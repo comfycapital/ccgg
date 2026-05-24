@@ -4,7 +4,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -16,7 +16,15 @@ from py_clob_client_v2.exceptions import PolyException
 from py_clob_client_v2.order_utils import SignatureTypeV2
 
 
+SCRIPT_NAME = "buy_yes_rank_1_at_03_utc_paris_temperature"
+SNAPSHOT_HOUR_UTC = 3
+TARGET_MARKET_RANK = 1
+
 ENV_FILE = Path(".env")
+STATE_FILE = Path(f"{SCRIPT_NAME}_state.json")
+BUY_ORDER_LOG_FILE = Path(f"{SCRIPT_NAME}.log")
+LOGGER_NAME = SCRIPT_NAME
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
 DEFAULT_CLOB_HOST = "https://clob.polymarket.com"
 DEFAULT_CHAIN_ID = POLYGON
@@ -25,16 +33,14 @@ DEFAULT_GAMMA_TAG_ID = 84
 DEFAULT_GAMMA_TAG_SLUG = "paris"
 DEFAULT_GAMMA_LIMIT = 100
 DEFAULT_GAMMA_START_DATE_LOOKBACK_DAYS = 7
-DEFAULT_PRICE_THRESHOLD = 0.90
 DEFAULT_MAX_BUY_PRICE = 0.99
-DEFAULT_POLL_INTERVAL_SECONDS = 5
-DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS = 300
+DEFAULT_POLL_INTERVAL_SECONDS = 30
+DEFAULT_SNAPSHOT_GRACE_SECONDS = 300
 
 REQUEST_TIMEOUT_SECONDS = 30
 MIN_BUY_AMOUNT_USDC = 5.0
 PRICE_UNIT_MAX = 1.0
 PRICE_PERCENT_MAX = 100.0
-MIN_UTC_TIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 MARKET_TIMEZONE_NAME = "Europe/Paris"
 TARGET_EVENT_TEXT = "highest temperature in paris"
@@ -48,10 +54,6 @@ CLOB_NO_MATCH_MESSAGE = "no match"
 NO_ASK_LIQUIDITY_REASON = "no_ask_liquidity"
 NO_PARTIAL_FILL_LIQUIDITY_REASON = "no_partial_fill_liquidity"
 
-BUY_ORDER_LOG_FILE = Path("buy_yes_above_90_paris_temperature.log")
-LOGGER_NAME = "buy_yes_above_90_paris_temperature"
-LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-
 PRIVATE_KEY_ENV = "POLY_PRIVATE_KEY"
 API_KEY_ENV = "POLY_API_KEY"
 API_SECRET_ENV = "POLY_API_SECRET"
@@ -61,10 +63,9 @@ FUNDER_ENV = "POLY_FUNDER"
 CLOB_HOST_ENV = "CLOB_HOST"
 CHAIN_ID_ENV = "POLY_CHAIN_ID"
 BUY_AMOUNT_ENV = "BUY_AMOUNT_USDC"
-PRICE_THRESHOLD_ENV = "PRICE_THRESHOLD"
 MAX_BUY_PRICE_ENV = "MAX_BUY_PRICE"
 POLL_INTERVAL_SECONDS_ENV = "POLL_INTERVAL_SECONDS"
-MARKET_REFRESH_INTERVAL_SECONDS_ENV = "MARKET_REFRESH_INTERVAL_SECONDS"
+SNAPSHOT_GRACE_SECONDS_ENV = "SNAPSHOT_GRACE_SECONDS"
 CONFIRM_BUY_ENV = "CONFIRM_BUY"
 TARGET_MARKET_DATE_ENV = "TARGET_MARKET_DATE"
 GAMMA_EVENTS_URL_ENV = "GAMMA_EVENTS_URL"
@@ -105,13 +106,18 @@ class MarketSnapshot:
     markets: list[TemperatureMarket]
 
 
+@dataclass(frozen=True)
+class RankedMarket:
+    market: TemperatureMarket
+    yes_price: float
+    rank: int
+
+
 def load_env_file() -> None:
     if not ENV_FILE.exists():
         return
 
-    env_lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
-
-    for env_line in env_lines:
+    for env_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
         line = env_line.strip()
 
         if not line or line.startswith(COMMENT_PREFIX):
@@ -228,9 +234,7 @@ def validate_confirmation() -> None:
 
 def validate_buy_amount(buy_amount_usdc: float) -> None:
     if buy_amount_usdc < MIN_BUY_AMOUNT_USDC:
-        raise ValueError(
-            f"{BUY_AMOUNT_ENV} must be at least {MIN_BUY_AMOUNT_USDC} for this market."
-        )
+        raise ValueError(f"{BUY_AMOUNT_ENV} must be at least {MIN_BUY_AMOUNT_USDC}.")
 
 
 def validate_positive_seconds(name: str, value: int) -> None:
@@ -290,21 +294,32 @@ def build_client() -> ClobClient:
     return client
 
 
-def resolve_target_market_date() -> str:
-    target_market_date = os.getenv(TARGET_MARKET_DATE_ENV)
-
-    if target_market_date:
-        return target_market_date
-
+def get_market_timezone() -> ZoneInfo:
     try:
-        market_timezone = ZoneInfo(MARKET_TIMEZONE_NAME)
+        return ZoneInfo(MARKET_TIMEZONE_NAME)
     except ZoneInfoNotFoundError as error:
         raise RuntimeError(
             f"Cannot load {MARKET_TIMEZONE_NAME}. Set {TARGET_MARKET_DATE_ENV}=YYYY-MM-DD "
             "or install Python timezone data."
         ) from error
 
-    return datetime.now(market_timezone).date().isoformat()
+
+def resolve_target_market_date() -> str:
+    target_market_date = os.getenv(TARGET_MARKET_DATE_ENV)
+
+    if target_market_date:
+        return target_market_date
+
+    return datetime.now(get_market_timezone()).date().isoformat()
+
+
+def build_snapshot_time_utc(target_date: str) -> datetime:
+    parsed_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+    return datetime.combine(
+        parsed_date,
+        datetime_time(hour=SNAPSHOT_HOUR_UTC),
+        tzinfo=timezone.utc,
+    )
 
 
 def build_gamma_start_date_min(target_date: str) -> str:
@@ -575,4 +590,91 @@ def extract_prices_from_entries(
             prices[token_id_text] = price
 
     return prices
+
+
+def extract_prices_from_keyed_dict(
+    response_json: dict[str, Any],
+    requested_token_ids: set[str],
+) -> dict[str, float]:
+    prices: dict[str, float] = {}
+
+    for token_id in requested_token_ids:
+        if token_id not in response_json:
+            continue
+
+        price = parse_price_payload(response_json.get(token_id))
+
+        if price is not None:
+            prices[token_id] = price
+
+    return prices
+
+
+def extract_yes_prices(
+    response_json: Any,
+    markets: list[TemperatureMarket],
+) -> dict[str, float]:
+    requested_token_ids = {market.yes_token_id for market in markets}
+
+    if isinstance(response_json, list):
+        return extract_prices_from_entries(response_json, requested_token_ids)
+
+    if not isinstance(response_json, dict):
+        return {}
+
+    prices = extract_prices_from_keyed_dict(response_json, requested_token_ids)
+
+    for list_key in PRICE_RESPONSE_LIST_KEYS:
+        list_value = response_json.get(list_key)
+
+        if isinstance(list_value, list):
+            prices.update(extract_prices_from_entries(list_value, requested_token_ids))
+
+        if isinstance(list_value, dict):
+            prices.update(extract_prices_from_keyed_dict(list_value, requested_token_ids))
+
+    return prices
+
+
+def get_yes_prices(
+    client: ClobClient,
+    markets: list[TemperatureMarket],
+) -> dict[str, float]:
+    price_requests = [
+        BookParams(token_id=market.yes_token_id, side=BUY_SIDE)
+        for market in markets
+    ]
+    response = client.get_prices(price_requests)
+    return extract_yes_prices(response, markets)
+
+
+def rank_markets_by_yes_price(
+    markets: list[TemperatureMarket],
+    prices_by_token_id: dict[str, float],
+) -> list[RankedMarket]:
+    priced_markets = [
+        (market, prices_by_token_id[market.yes_token_id])
+        for market in markets
+        if market.yes_token_id in prices_by_token_id
+    ]
+    priced_markets.sort(key=lambda item: (-item[1], item[0].temperature_celsius, item[0].market_id))
+
+    return [
+        RankedMarket(market=market, yes_price=yes_price, rank=index + 1)
+        for index, (market, yes_price) in enumerate(priced_markets)
+    ]
+
+
+def build_price_snapshot(ranked_markets: list[RankedMarket]) -> list[dict[str, Any]]:
+    return [
+        {
+            "market_id": ranked_market.market.market_id,
+            "question": ranked_market.market.question,
+            "rank": ranked_market.rank,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "yes_price": ranked_market.yes_price,
+            "yes_token_id": ranked_market.market.yes_token_id,
+        }
+        for ranked_market in ranked_markets
+    ]
 
