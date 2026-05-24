@@ -1,79 +1,3 @@
-def extract_prices_from_keyed_dict(
-    response_json: dict[str, Any],
-    requested_token_ids: set[str],
-) -> dict[str, float]:
-    prices: dict[str, float] = {}
-
-    for token_id in requested_token_ids:
-        if token_id not in response_json:
-            continue
-
-        price = parse_price_payload(response_json.get(token_id))
-
-        if price is not None:
-            prices[token_id] = price
-
-    return prices
-
-
-def extract_yes_prices(
-    response_json: Any,
-    markets: list[TemperatureMarket],
-) -> dict[str, float]:
-    requested_token_ids = {market.yes_token_id for market in markets}
-
-    if isinstance(response_json, list):
-        return extract_prices_from_entries(response_json, requested_token_ids)
-
-    if not isinstance(response_json, dict):
-        return {}
-
-    prices = extract_prices_from_keyed_dict(response_json, requested_token_ids)
-
-    for list_key in PRICE_RESPONSE_LIST_KEYS:
-        list_value = response_json.get(list_key)
-
-        if isinstance(list_value, list):
-            prices.update(extract_prices_from_entries(list_value, requested_token_ids))
-
-        if isinstance(list_value, dict):
-            prices.update(extract_prices_from_keyed_dict(list_value, requested_token_ids))
-
-    return prices
-
-
-def get_yes_prices(
-    client: ClobClient,
-    markets: list[TemperatureMarket],
-) -> dict[str, float]:
-    price_requests = [
-        BookParams(token_id=market.yes_token_id, side=BUY_SIDE)
-        for market in markets
-    ]
-    response = client.get_prices(price_requests)
-    return extract_yes_prices(response, markets)
-
-
-def build_price_snapshot(
-    markets: list[TemperatureMarket],
-    prices_by_token_id: dict[str, float],
-) -> list[dict[str, Any]]:
-    price_snapshot = []
-
-    for market in markets:
-        price_snapshot.append(
-            {
-                "market_id": market.market_id,
-                "question": market.question,
-                "temperature_celsius": market.temperature_celsius,
-                "yes_price": prices_by_token_id.get(market.yes_token_id),
-                "yes_token_id": market.yes_token_id,
-            }
-        )
-
-    return price_snapshot
-
-
 def get_error_message(error: Exception) -> str:
     exception_message = getattr(error, "msg", "")
 
@@ -98,8 +22,7 @@ def get_clob_no_match_reason(error: Exception) -> Optional[str]:
 def log_order_skipped_no_liquidity(
     logger: logging.Logger,
     snapshot: MarketSnapshot,
-    market: TemperatureMarket,
-    trigger_price: float,
+    ranked_market: RankedMarket,
     buy_amount_usdc: float,
     max_buy_price: float,
     reason: str,
@@ -110,21 +33,22 @@ def log_order_skipped_no_liquidity(
         "order_skipped_no_liquidity",
         {
             "amount_usdc": buy_amount_usdc,
-            "condition_id": market.condition_id,
+            "condition_id": ranked_market.market.condition_id,
             "error": get_error_message(error),
             "error_type": type(error).__name__,
             "event_id": snapshot.event.get("id"),
             "event_title": snapshot.event.get("title"),
-            "market_id": market.market_id,
+            "market_id": ranked_market.market.market_id,
             "market_order_type": MARKET_ORDER_TYPE,
+            "market_rank": ranked_market.rank,
             "max_buy_price": max_buy_price,
-            "question": market.question,
+            "question": ranked_market.market.question,
             "reason": reason,
             "side": BUY_SIDE,
             "target_date": snapshot.target_date,
-            "temperature_celsius": market.temperature_celsius,
-            "trigger_price": trigger_price,
-            "yes_token_id": market.yes_token_id,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "trigger_price": ranked_market.yes_price,
+            "yes_token_id": ranked_market.market.yes_token_id,
         },
     )
 
@@ -132,8 +56,7 @@ def log_order_skipped_no_liquidity(
 def log_order_skipped_price_above_max(
     logger: logging.Logger,
     snapshot: MarketSnapshot,
-    market: TemperatureMarket,
-    trigger_price: float,
+    ranked_market: RankedMarket,
     required_price: float,
     buy_amount_usdc: float,
     max_buy_price: float,
@@ -143,19 +66,20 @@ def log_order_skipped_price_above_max(
         "order_skipped_price_above_max",
         {
             "amount_usdc": buy_amount_usdc,
-            "condition_id": market.condition_id,
+            "condition_id": ranked_market.market.condition_id,
             "event_id": snapshot.event.get("id"),
             "event_title": snapshot.event.get("title"),
-            "market_id": market.market_id,
+            "market_id": ranked_market.market.market_id,
             "market_order_type": MARKET_ORDER_TYPE,
+            "market_rank": ranked_market.rank,
             "max_buy_price": max_buy_price,
-            "question": market.question,
+            "question": ranked_market.market.question,
             "required_price": required_price,
             "side": BUY_SIDE,
             "target_date": snapshot.target_date,
-            "temperature_celsius": market.temperature_celsius,
-            "trigger_price": trigger_price,
-            "yes_token_id": market.yes_token_id,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "trigger_price": ranked_market.yes_price,
+            "yes_token_id": ranked_market.market.yes_token_id,
         },
     )
 
@@ -163,8 +87,7 @@ def log_order_skipped_price_above_max(
 def log_order_skipped_trigger_above_max(
     logger: logging.Logger,
     snapshot: MarketSnapshot,
-    market: TemperatureMarket,
-    trigger_price: float,
+    ranked_market: RankedMarket,
     buy_amount_usdc: float,
     max_buy_price: float,
 ) -> None:
@@ -173,18 +96,18 @@ def log_order_skipped_trigger_above_max(
         "order_skipped_trigger_above_max",
         {
             "amount_usdc": buy_amount_usdc,
-            "condition_id": market.condition_id,
+            "condition_id": ranked_market.market.condition_id,
             "event_id": snapshot.event.get("id"),
             "event_title": snapshot.event.get("title"),
-            "market_id": market.market_id,
-            "market_order_type": MARKET_ORDER_TYPE,
+            "market_id": ranked_market.market.market_id,
+            "market_rank": ranked_market.rank,
             "max_buy_price": max_buy_price,
-            "question": market.question,
+            "question": ranked_market.market.question,
             "side": BUY_SIDE,
             "target_date": snapshot.target_date,
-            "temperature_celsius": market.temperature_celsius,
-            "trigger_price": trigger_price,
-            "yes_token_id": market.yes_token_id,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "trigger_price": ranked_market.yes_price,
+            "yes_token_id": ranked_market.market.yes_token_id,
         },
     )
 
@@ -216,28 +139,30 @@ def build_order_args(
     )
 
 
-def buy_yes_market(
+def buy_ranked_yes_market(
     client: ClobClient,
     logger: logging.Logger,
     snapshot: MarketSnapshot,
-    market: TemperatureMarket,
-    trigger_price: float,
+    ranked_market: RankedMarket,
     buy_amount_usdc: float,
     max_buy_price: float,
 ) -> Optional[dict[str, Any]]:
-    if trigger_price > max_buy_price:
+    if ranked_market.yes_price > max_buy_price:
         log_order_skipped_trigger_above_max(
             logger=logger,
             snapshot=snapshot,
-            market=market,
-            trigger_price=trigger_price,
+            ranked_market=ranked_market,
             buy_amount_usdc=buy_amount_usdc,
             max_buy_price=max_buy_price,
         )
         return None
 
     try:
-        required_price = calculate_required_market_price(client, market, buy_amount_usdc)
+        required_price = calculate_required_market_price(
+            client=client,
+            market=ranked_market.market,
+            buy_amount_usdc=buy_amount_usdc,
+        )
     except Exception as error:
         no_match_reason = get_clob_no_match_reason(error)
 
@@ -247,8 +172,7 @@ def buy_yes_market(
         log_order_skipped_no_liquidity(
             logger=logger,
             snapshot=snapshot,
-            market=market,
-            trigger_price=trigger_price,
+            ranked_market=ranked_market,
             buy_amount_usdc=buy_amount_usdc,
             max_buy_price=max_buy_price,
             reason=no_match_reason,
@@ -260,34 +184,38 @@ def buy_yes_market(
         log_order_skipped_price_above_max(
             logger=logger,
             snapshot=snapshot,
-            market=market,
-            trigger_price=trigger_price,
+            ranked_market=ranked_market,
             required_price=required_price,
             buy_amount_usdc=buy_amount_usdc,
             max_buy_price=max_buy_price,
         )
         return None
 
-    order_args = build_order_args(market, buy_amount_usdc, max_buy_price)
+    order_args = build_order_args(
+        market=ranked_market.market,
+        buy_amount_usdc=buy_amount_usdc,
+        max_buy_price=max_buy_price,
+    )
 
     log_json(
         logger,
         "order_attempt",
         {
             "amount_usdc": buy_amount_usdc,
-            "condition_id": market.condition_id,
+            "condition_id": ranked_market.market.condition_id,
             "event_id": snapshot.event.get("id"),
             "event_title": snapshot.event.get("title"),
-            "market_id": market.market_id,
+            "market_id": ranked_market.market.market_id,
             "market_order_type": MARKET_ORDER_TYPE,
+            "market_rank": ranked_market.rank,
             "max_buy_price": max_buy_price,
-            "question": market.question,
+            "question": ranked_market.market.question,
             "required_price": required_price,
             "side": BUY_SIDE,
             "target_date": snapshot.target_date,
-            "temperature_celsius": market.temperature_celsius,
-            "trigger_price": trigger_price,
-            "yes_token_id": market.yes_token_id,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "trigger_price": ranked_market.yes_price,
+            "yes_token_id": ranked_market.market.yes_token_id,
         },
     )
 
@@ -300,112 +228,249 @@ def buy_yes_market(
     return payload
 
 
-def run_price_cycle(
-    client: ClobClient,
-    logger: logging.Logger,
-    snapshot: MarketSnapshot,
-    bought_market_ids: set[str],
-    buy_amount_usdc: float,
-    price_threshold: float,
-    max_buy_price: float,
-) -> None:
-    unbought_markets = [
-        market
-        for market in snapshot.markets
-        if market.market_id not in bought_market_ids
-    ]
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {"processed_order_keys": [], "processed_records": []}
 
-    if not unbought_markets:
-        log_json(
-            logger,
-            "all_markets_already_bought",
-            {
-                "event_id": snapshot.event.get("id"),
-                "target_date": snapshot.target_date,
-            },
-        )
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"processed_order_keys": [], "processed_records": []}
+
+    if not isinstance(state, dict):
+        return {"processed_order_keys": [], "processed_records": []}
+
+    state.setdefault("processed_order_keys", [])
+    state.setdefault("processed_records", [])
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def build_order_key(target_date: str) -> str:
+    return f"{target_date}:hour={SNAPSHOT_HOUR_UTC}:rank={TARGET_MARKET_RANK}:side=YES"
+
+
+def is_order_key_processed(state: dict[str, Any], order_key: str) -> bool:
+    processed_order_keys = state.get("processed_order_keys", [])
+    return isinstance(processed_order_keys, list) and order_key in processed_order_keys
+
+
+def mark_order_key_processed(
+    state: dict[str, Any],
+    order_key: str,
+    status: str,
+    payload: dict[str, Any],
+) -> None:
+    processed_order_keys = state.setdefault("processed_order_keys", [])
+    processed_records = state.setdefault("processed_records", [])
+
+    if order_key not in processed_order_keys:
+        processed_order_keys.append(order_key)
+
+    processed_records.append(
+        {
+            "order_key": order_key,
+            "payload": payload,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+        }
+    )
+    save_state(state)
+
+
+def wait_for_snapshot_window(
+    snapshot_time: datetime,
+    snapshot_grace_seconds: int,
+    logger: logging.Logger,
+) -> bool:
+    snapshot_deadline = snapshot_time + timedelta(seconds=snapshot_grace_seconds)
+
+    while True:
+        now = datetime.now(timezone.utc)
+
+        if now < snapshot_time:
+            seconds_until_snapshot = (snapshot_time - now).total_seconds()
+            log_json(
+                logger,
+                "snapshot_wait",
+                {
+                    "seconds_until_snapshot": round(seconds_until_snapshot, 3),
+                    "snapshot_time": snapshot_time.isoformat(),
+                },
+            )
+            time.sleep(min(seconds_until_snapshot, 60))
+            continue
+
+        if now > snapshot_deadline:
+            log_json(
+                logger,
+                "snapshot_window_missed",
+                {
+                    "now": now.isoformat(),
+                    "snapshot_deadline": snapshot_deadline.isoformat(),
+                    "snapshot_grace_seconds": snapshot_grace_seconds,
+                    "snapshot_time": snapshot_time.isoformat(),
+                },
+            )
+            return False
+
+        return True
+
+
+def sleep_after_processed_date(
+    target_date: str,
+    logger: logging.Logger,
+    poll_interval_seconds: int,
+) -> None:
+    if os.getenv(TARGET_MARKET_DATE_ENV):
+        time.sleep(poll_interval_seconds)
         return
 
-    prices_by_token_id = get_yes_prices(client, unbought_markets)
-    price_snapshot = build_price_snapshot(unbought_markets, prices_by_token_id)
+    market_timezone = get_market_timezone()
+    now = datetime.now(market_timezone)
+    tomorrow = now.date() + timedelta(days=1)
+    next_check = datetime.combine(
+        tomorrow,
+        datetime_time(hour=0, minute=1),
+        tzinfo=market_timezone,
+    )
+    seconds_until_next_check = max(
+        poll_interval_seconds,
+        int((next_check - now).total_seconds()),
+    )
+    log_json(
+        logger,
+        "next_market_date_wait",
+        {
+            "seconds_until_next_check": seconds_until_next_check,
+            "target_date": target_date,
+        },
+    )
+    time.sleep(seconds_until_next_check)
+
+
+def execute_snapshot_order(
+    client: ClobClient,
+    logger: logging.Logger,
+    state: dict[str, Any],
+    target_date: str,
+    buy_amount_usdc: float,
+    max_buy_price: float,
+) -> bool:
+    snapshot = load_market_snapshot(target_date, logger)
+    prices_by_token_id = get_yes_prices(client, snapshot.markets)
+    ranked_markets = rank_markets_by_yes_price(snapshot.markets, prices_by_token_id)
+    price_snapshot = build_price_snapshot(ranked_markets)
 
     log_json(
         logger,
-        "prices_polled",
+        "ranked_prices_polled",
         {
             "event_id": snapshot.event.get("id"),
-            "price_count": len(prices_by_token_id),
-            "price_threshold": price_threshold,
+            "market_count": len(snapshot.markets),
+            "priced_market_count": len(ranked_markets),
             "prices": price_snapshot,
-            "target_date": snapshot.target_date,
+            "target_date": target_date,
+            "target_market_rank": TARGET_MARKET_RANK,
         },
     )
 
-    for market in unbought_markets:
-        trigger_price = prices_by_token_id.get(market.yes_token_id)
-
-        if trigger_price is None or trigger_price <= price_threshold:
-            continue
-
+    if len(ranked_markets) < TARGET_MARKET_RANK:
         log_json(
             logger,
-            "price_triggered",
+            "order_skipped_not_enough_priced_markets",
             {
-                "event_id": snapshot.event.get("id"),
-                "market_id": market.market_id,
-                "price_threshold": price_threshold,
-                "question": market.question,
-                "target_date": snapshot.target_date,
-                "temperature_celsius": market.temperature_celsius,
-                "trigger_price": trigger_price,
-                "yes_token_id": market.yes_token_id,
+                "priced_market_count": len(ranked_markets),
+                "target_market_rank": TARGET_MARKET_RANK,
             },
         )
+        return False
 
-        order_response = buy_yes_market(
-            client=client,
-            logger=logger,
-            snapshot=snapshot,
-            market=market,
-            trigger_price=trigger_price,
-            buy_amount_usdc=buy_amount_usdc,
-            max_buy_price=max_buy_price,
-        )
+    ranked_market = ranked_markets[TARGET_MARKET_RANK - 1]
+    order_key = build_order_key(target_date)
 
-        if order_response is not None:
-            bought_market_ids.add(market.market_id)
+    log_json(
+        logger,
+        "ranked_market_selected",
+        {
+            "event_id": snapshot.event.get("id"),
+            "market_id": ranked_market.market.market_id,
+            "market_rank": ranked_market.rank,
+            "question": ranked_market.market.question,
+            "target_date": target_date,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "yes_price": ranked_market.yes_price,
+            "yes_token_id": ranked_market.market.yes_token_id,
+        },
+    )
+
+    order_response = buy_ranked_yes_market(
+        client=client,
+        logger=logger,
+        snapshot=snapshot,
+        ranked_market=ranked_market,
+        buy_amount_usdc=buy_amount_usdc,
+        max_buy_price=max_buy_price,
+    )
+
+    status = "order_posted" if order_response is not None else "order_skipped"
+    mark_order_key_processed(
+        state=state,
+        order_key=order_key,
+        status=status,
+        payload={
+            "market_id": ranked_market.market.market_id,
+            "market_rank": ranked_market.rank,
+            "target_date": target_date,
+            "yes_price": ranked_market.yes_price,
+            "yes_token_id": ranked_market.market.yes_token_id,
+        },
+    )
+    return True
 
 
-def maybe_refresh_market_snapshot(
+def run_snapshot_cycle(
+    client: ClobClient,
     logger: logging.Logger,
-    snapshot: Optional[MarketSnapshot],
-    bought_market_ids: set[str],
-    next_market_refresh_time: datetime,
-    market_refresh_interval_seconds: int,
-) -> tuple[MarketSnapshot, datetime]:
+    state: dict[str, Any],
+    buy_amount_usdc: float,
+    max_buy_price: float,
+    snapshot_grace_seconds: int,
+    poll_interval_seconds: int,
+) -> None:
     target_date = resolve_target_market_date()
-    now = datetime.now(timezone.utc)
-    needs_first_load = snapshot is None
-    needs_date_reload = snapshot is not None and snapshot.target_date != target_date
-    needs_scheduled_reload = now >= next_market_refresh_time
+    order_key = build_order_key(target_date)
 
-    if not (needs_first_load or needs_date_reload or needs_scheduled_reload):
-        return snapshot, next_market_refresh_time
+    if is_order_key_processed(state, order_key):
+        log_json(logger, "order_skipped_already_processed", {"order_key": order_key})
+        sleep_after_processed_date(target_date, logger, poll_interval_seconds)
+        return
 
-    if needs_date_reload:
-        bought_market_ids.clear()
-        log_json(
-            logger,
-            "target_date_changed",
-            {
-                "new_target_date": target_date,
-                "old_target_date": snapshot.target_date if snapshot else None,
-            },
-        )
+    snapshot_time = build_snapshot_time_utc(target_date)
 
-    refreshed_snapshot = load_market_snapshot(target_date, logger)
-    refreshed_next_market_refresh_time = now + timedelta(seconds=market_refresh_interval_seconds)
-    return refreshed_snapshot, refreshed_next_market_refresh_time
+    if not wait_for_snapshot_window(snapshot_time, snapshot_grace_seconds, logger):
+        sleep_after_processed_date(target_date, logger, poll_interval_seconds)
+        return
+
+    executed = execute_snapshot_order(
+        client=client,
+        logger=logger,
+        state=state,
+        target_date=target_date,
+        buy_amount_usdc=buy_amount_usdc,
+        max_buy_price=max_buy_price,
+    )
+
+    if executed:
+        sleep_after_processed_date(target_date, logger, poll_interval_seconds)
+    else:
+        time.sleep(poll_interval_seconds)
 
 
 def run_forever() -> None:
@@ -414,50 +479,52 @@ def run_forever() -> None:
     validate_confirmation()
 
     buy_amount_usdc = get_float_env(BUY_AMOUNT_ENV)
-    price_threshold = get_probability_env(PRICE_THRESHOLD_ENV, DEFAULT_PRICE_THRESHOLD)
     max_buy_price = get_probability_env(MAX_BUY_PRICE_ENV, DEFAULT_MAX_BUY_PRICE)
     poll_interval_seconds = get_int_env(
         POLL_INTERVAL_SECONDS_ENV,
         DEFAULT_POLL_INTERVAL_SECONDS,
     )
-    market_refresh_interval_seconds = get_int_env(
-        MARKET_REFRESH_INTERVAL_SECONDS_ENV,
-        DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS,
+    snapshot_grace_seconds = get_int_env(
+        SNAPSHOT_GRACE_SECONDS_ENV,
+        DEFAULT_SNAPSHOT_GRACE_SECONDS,
     )
 
     validate_buy_amount(buy_amount_usdc)
     validate_positive_seconds(POLL_INTERVAL_SECONDS_ENV, poll_interval_seconds)
-    validate_positive_seconds(MARKET_REFRESH_INTERVAL_SECONDS_ENV, market_refresh_interval_seconds)
+    validate_positive_seconds(SNAPSHOT_GRACE_SECONDS_ENV, snapshot_grace_seconds)
+
+    log_json(
+        logger,
+        "script_started",
+        {
+            "buy_amount_usdc": buy_amount_usdc,
+            "market_rank": TARGET_MARKET_RANK,
+            "max_buy_price": max_buy_price,
+            "poll_interval_seconds": poll_interval_seconds,
+            "snapshot_grace_seconds": snapshot_grace_seconds,
+            "snapshot_hour_utc": SNAPSHOT_HOUR_UTC,
+        },
+    )
 
     client = build_client()
-    snapshot: Optional[MarketSnapshot] = None
-    bought_market_ids: set[str] = set()
-    next_market_refresh_time = MIN_UTC_TIME
+    state = load_state()
 
     while True:
         try:
-            snapshot, next_market_refresh_time = maybe_refresh_market_snapshot(
-                logger=logger,
-                snapshot=snapshot,
-                bought_market_ids=bought_market_ids,
-                next_market_refresh_time=next_market_refresh_time,
-                market_refresh_interval_seconds=market_refresh_interval_seconds,
-            )
-            run_price_cycle(
+            run_snapshot_cycle(
                 client=client,
                 logger=logger,
-                snapshot=snapshot,
-                bought_market_ids=bought_market_ids,
+                state=state,
                 buy_amount_usdc=buy_amount_usdc,
-                price_threshold=price_threshold,
                 max_buy_price=max_buy_price,
+                snapshot_grace_seconds=snapshot_grace_seconds,
+                poll_interval_seconds=poll_interval_seconds,
             )
         except KeyboardInterrupt:
             raise
         except Exception as error:
             logger.exception("cycle_error %s", error)
-
-        time.sleep(poll_interval_seconds)
+            time.sleep(poll_interval_seconds)
 
 
 if __name__ == "__main__":
