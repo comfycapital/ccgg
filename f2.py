@@ -1,1010 +1,1276 @@
-def build_temperature_market(
-    event: dict[str, Any],
-    cutoff_time: datetime,
-    market: dict[str, Any],
-) -> TemperatureMarket:
-    return TemperatureMarket(
-        event_id=str(event.get("id") or ""),
-        event_title=str(event.get("title") or ""),
-        event_date=str(event.get("eventDate") or ""),
-        event_cutoff_time=cutoff_time,
-        market_id=str(market.get("id") or ""),
-        condition_id=str(market.get("conditionId") or ""),
-        question=str(market.get("question") or ""),
-        slug=str(market.get("slug") or ""),
-        group_item_title=str(market.get("groupItemTitle") or ""),
-        temperature_celsius=parse_market_temperature(market),
-        yes_token_id=get_outcome_token_id(market, YES_OUTCOME),
-        tick_size=parse_optional_decimal(market.get("orderPriceMinTickSize")),
-        order_min_size=parse_order_min_size(market.get("orderMinSize")),
-        active=market.get("active") is True,
-        closed=market.get("closed") is True,
-        accepting_orders=market.get("acceptingOrders") is True,
-    )
-
-
-def build_temperature_event(
-    event: dict[str, Any],
+def log_order_skipped_price_above_max(
     logger: logging.Logger,
-) -> TemperatureEvent:
-    markets = event.get("markets")
-
-    if not isinstance(markets, list):
-        raise ValueError("Target event does not contain a markets list.")
-
-    cutoff_time = parse_event_cutoff_time(event)
-    temperature_markets = []
-
-    for market in markets:
-        if not isinstance(market, dict):
-            continue
-
-        try:
-            temperature_markets.append(build_temperature_market(event, cutoff_time, market))
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            log_json(
-                logger,
-                "market_skipped",
-                {
-                    "error": str(error),
-                    "event_id": event.get("id"),
-                    "market_id": market.get("id"),
-                    "question": market.get("question"),
-                },
-            )
-
-    return TemperatureEvent(
-        event_id=str(event.get("id") or ""),
-        title=str(event.get("title") or ""),
-        slug=str(event.get("slug") or ""),
-        event_date=str(event.get("eventDate") or ""),
-        cutoff_time=cutoff_time,
-        markets=sorted(temperature_markets, key=lambda item: item.temperature_celsius),
-    )
-
-
-def is_tradeable_market(market: TemperatureMarket) -> bool:
-    return market.closed is False and market.active is True and market.accepting_orders is True
-
-
-def get_tradeable_markets(event: TemperatureEvent) -> list[TemperatureMarket]:
-    return [market for market in event.markets if is_tradeable_market(market)]
-
-
-def load_temperature_events(logger: logging.Logger) -> list[TemperatureEvent]:
-    raw_events = get_gamma_events()
-    temperature_events = []
-
-    for event in raw_events:
-        if not is_target_temperature_event(event):
-            continue
-
-        temperature_event = build_temperature_event(event, logger)
-
-        if not temperature_event.markets:
-            log_json(
-                logger,
-                "event_skipped_no_markets",
-                {"event_id": temperature_event.event_id, "title": temperature_event.title},
-            )
-            continue
-
-        temperature_events.append(temperature_event)
-
-    temperature_events.sort(key=lambda item: (item.cutoff_time, item.event_id))
-
+    snapshot: MarketSnapshot,
+    ranked_market: RankedMarket,
+    target_outcome: str,
+    required_price: float,
+    buy_amount_usdc: float,
+    max_buy_price: float,
+) -> None:
+    outcome_token_id = get_market_outcome_token_id(ranked_market.market, target_outcome)
     log_json(
         logger,
-        "events_loaded",
+        "order_skipped_price_above_max",
         {
-            "event_count": len(temperature_events),
-            "events": [
-                {
-                    "cutoff_time": event.cutoff_time.isoformat(),
-                    "event_date": event.event_date,
-                    "event_id": event.event_id,
-                    "market_count": len(event.markets),
-                    "title": event.title,
-                    "tradeable_market_count": len(get_tradeable_markets(event)),
-                }
-                for event in temperature_events
-            ],
+            "amount_usdc": buy_amount_usdc,
+            "condition_id": ranked_market.market.condition_id,
+            "event_id": snapshot.event.get("id"),
+            "event_title": snapshot.event.get("title"),
+            "market_id": ranked_market.market.market_id,
+            "market_order_type": MARKET_ORDER_TYPE,
+            "market_rank": ranked_market.rank,
+            "max_buy_price": max_buy_price,
+            "question": ranked_market.market.question,
+            "required_price": required_price,
+            "side": BUY_SIDE,
+            "target_date": snapshot.target_date,
+            "target_outcome": target_outcome,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "trigger_price": ranked_market.outcome_price,
+            "outcome_token_id": outcome_token_id,
         },
     )
 
-    return temperature_events
 
-
-def parse_numeric_price(value: Any) -> Optional[float]:
-    if isinstance(value, bool):
-        return None
-
-    if isinstance(value, (int, float)):
-        return normalize_probability_value(float(value))
-
-    if isinstance(value, str):
-        text = value.strip()
-
-        if not text:
-            return None
-
-        return normalize_probability_value(float(text))
-
-    return None
-
-
-def parse_price_payload(value: Any, side: str) -> Optional[float]:
-    direct_price = parse_numeric_price(value)
-
-    if direct_price is not None:
-        return direct_price
-
-    if not isinstance(value, dict):
-        return None
-
-    for price_key in PRICE_RESPONSE_VALUE_KEYS_BY_SIDE[side]:
-        if price_key not in value:
-            continue
-
-        price = parse_numeric_price(value.get(price_key))
-
-        if price is not None:
-            return price
-
-    return None
-
-
-def get_first_mapping_value(source: dict[str, Any], keys: tuple[str, ...]) -> Optional[Any]:
-    for key in keys:
-        if key in source:
-            return source.get(key)
-
-    return None
-
-
-def extract_prices_from_entries(
-    entries: list[Any],
-    requested_token_ids: set[str],
-    side: str,
-) -> dict[str, float]:
-    prices: dict[str, float] = {}
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-
-        token_id = get_first_mapping_value(entry, PRICE_RESPONSE_TOKEN_KEYS)
-
-        if token_id is None:
-            continue
-
-        token_id_text = str(token_id)
-
-        if token_id_text not in requested_token_ids:
-            continue
-
-        response_side = get_first_mapping_value(entry, PRICE_RESPONSE_SIDE_KEYS)
-
-        if response_side is not None and str(response_side).upper() != side:
-            continue
-
-        price = parse_price_payload(entry, side)
-
-        if price is not None:
-            prices[token_id_text] = price
-
-    return prices
-
-
-def extract_prices_from_keyed_dict(
-    response_json: dict[str, Any],
-    requested_token_ids: set[str],
-    side: str,
-) -> dict[str, float]:
-    prices: dict[str, float] = {}
-
-    for token_id in requested_token_ids:
-        if token_id not in response_json:
-            continue
-
-        price = parse_price_payload(response_json.get(token_id), side)
-
-        if price is not None:
-            prices[token_id] = price
-
-    return prices
-
-
-def extract_side_prices(
-    response_json: Any,
-    markets: list[TemperatureMarket],
-    side: str,
-) -> dict[str, float]:
-    requested_token_ids = {market.yes_token_id for market in markets}
-
-    if isinstance(response_json, list):
-        return extract_prices_from_entries(response_json, requested_token_ids, side)
-
-    if not isinstance(response_json, dict):
-        return {}
-
-    prices = extract_prices_from_keyed_dict(response_json, requested_token_ids, side)
-
-    for list_key in PRICE_RESPONSE_LIST_KEYS:
-        list_value = response_json.get(list_key)
-
-        if isinstance(list_value, list):
-            prices.update(extract_prices_from_entries(list_value, requested_token_ids, side))
-
-        if isinstance(list_value, dict):
-            prices.update(extract_prices_from_keyed_dict(list_value, requested_token_ids, side))
-
-    return prices
-
-
-def get_yes_side_prices(
-    client: ClobClient,
-    markets: list[TemperatureMarket],
-    side: str,
-) -> dict[str, float]:
-    if not markets:
-        return {}
-
-    price_requests = [
-        BookParams(token_id=market.yes_token_id, side=side)
-        for market in markets
-    ]
-    response = client.get_prices(price_requests)
-    return extract_side_prices(response, markets, side)
-
-
-def build_price_snapshot(
-    markets: list[TemperatureMarket],
-    buy_prices_by_token_id: dict[str, float],
-    sell_prices_by_token_id: dict[str, float],
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "event_id": market.event_id,
-            "market_id": market.market_id,
-            "question": market.question,
-            "temperature_celsius": market.temperature_celsius,
-            "yes_buy_price": buy_prices_by_token_id.get(market.yes_token_id),
-            "yes_sell_price": sell_prices_by_token_id.get(market.yes_token_id),
-            "yes_token_id": market.yes_token_id,
-        }
-        for market in markets
-    ]
-
-
-def decimal_price_to_float(value: Decimal) -> float:
-    return float(value)
-
-
-def decimal_price_to_log(value: Decimal) -> str:
-    return format(value.normalize(), "f")
-
-
-def get_market_tick_size(client: ClobClient, market: TemperatureMarket) -> Decimal:
-    if market.tick_size is not None:
-        return market.tick_size
-
-    return parse_decimal_text(str(client.get_tick_size(market.yes_token_id)))
-
-
-def is_valid_limit_price(price: Decimal, tick_size: Decimal) -> bool:
-    if price < tick_size:
-        return False
-
-    if price > Decimal("1") - tick_size:
-        return False
-
-    units = price / tick_size
-    return units == units.to_integral_value()
-
-
-def get_open_order_side(order: dict[str, Any]) -> Optional[str]:
-    side = get_first_mapping_value(order, OPEN_ORDER_SIDE_KEYS)
-
-    if side is None:
-        return None
-
-    return str(side).upper()
-
-
-def get_open_order_asset_id(order: dict[str, Any]) -> Optional[str]:
-    asset_id = get_first_mapping_value(order, OPEN_ORDER_ASSET_KEYS)
-
-    if asset_id is None:
-        return None
-
-    return str(asset_id)
-
-
-def parse_open_order_price(order: dict[str, Any]) -> Optional[Decimal]:
-    for key in OPEN_ORDER_PRICE_KEYS:
-        value = order.get(key)
-
-        if value is None or value == "":
-            continue
-
-        return parse_decimal_text(str(value))
-
-    return None
-
-
-def get_open_buy_order_prices(
-    client: ClobClient,
-    market: TemperatureMarket,
-) -> set[Decimal]:
-    orders = client.get_open_orders(OpenOrderParams(asset_id=market.yes_token_id))
-    open_prices: set[Decimal] = set()
-
-    for order in orders:
-        if not isinstance(order, dict):
-            continue
-
-        asset_id = get_open_order_asset_id(order)
-
-        if asset_id is not None and asset_id != market.yes_token_id:
-            continue
-
-        side = get_open_order_side(order)
-
-        if side is not None and side != BUY_SIDE:
-            continue
-
-        price = parse_open_order_price(order)
-
-        if price is not None:
-            open_prices.add(price)
-
-    return open_prices
-
-
-def ensure_limit_orders_for_market(
-    client: ClobClient,
+def log_order_skipped_trigger_above_max(
     logger: logging.Logger,
-    state: RuntimeState,
-    config: StrategyConfig,
-    market: TemperatureMarket,
-    trigger_price: float,
+    snapshot: MarketSnapshot,
+    ranked_market: RankedMarket,
+    target_outcome: str,
+    buy_amount_usdc: float,
+    max_buy_price: float,
 ) -> None:
-    if config.order_size_shares < market.order_min_size:
-        log_json(
-            logger,
-            "limit_orders_skipped_order_size_below_market_min",
-            {
-                "configured_order_size_shares": config.order_size_shares,
-                "market_id": market.market_id,
-                "market_order_min_size": market.order_min_size,
-                "question": market.question,
-            },
-        )
-        return
-
-    tick_size = get_market_tick_size(client, market)
-    posted_prices = set(state.posted_order_prices_by_market.get(market.market_id, set()))
-    open_prices = get_open_buy_order_prices(client, market)
-    tracked_limit_prices = set(config.limit_order_prices)
-    posted_prices.update(open_prices.intersection(tracked_limit_prices))
-
-    if posted_prices:
-        state.posted_order_prices_by_market[market.market_id] = posted_prices
-
-    for limit_price in config.limit_order_prices:
-        if limit_price in posted_prices:
-            continue
-
-        if not is_valid_limit_price(limit_price, tick_size):
-            log_json(
-                logger,
-                "limit_order_price_skipped_invalid_tick",
-                {
-                    "limit_price": decimal_price_to_log(limit_price),
-                    "market_id": market.market_id,
-                    "question": market.question,
-                    "tick_size": decimal_price_to_log(tick_size),
-                },
-            )
-            continue
-
-        order_args = OrderArgsV2(
-            token_id=market.yes_token_id,
-            price=decimal_price_to_float(limit_price),
-            size=config.order_size_shares,
-            side=BUY_SIDE,
-        )
-
-        log_json(
-            logger,
-            "limit_order_attempt",
-            {
-                "event_id": market.event_id,
-                "event_title": market.event_title,
-                "limit_price": decimal_price_to_log(limit_price),
-                "market_id": market.market_id,
-                "order_size_shares": config.order_size_shares,
-                "order_type": LIMIT_ORDER_TYPE,
-                "post_only": True,
-                "question": market.question,
-                "tick_size": decimal_price_to_log(tick_size),
-                "trigger_yes_buy_price": trigger_price,
-                "yes_token_id": market.yes_token_id,
-            },
-        )
-
-        response = client.create_and_post_order(
-            order_args,
-            order_type=LIMIT_ORDER_TYPE,
-            post_only=True,
-        )
-        payload = response if isinstance(response, dict) else {"response": response}
-        log_json(logger, "limit_order_response", payload)
-        posted_prices.add(limit_price)
-        state.posted_order_prices_by_market[market.market_id] = posted_prices
-
-
-def select_entry_markets_for_event(
-    event: TemperatureEvent,
-    buy_prices_by_token_id: dict[str, float],
-    config: StrategyConfig,
-    deactivated_market_ids: set[str],
-) -> list[tuple[TemperatureMarket, float]]:
-    candidates = []
-
-    for market in get_tradeable_markets(event):
-        if market.market_id in deactivated_market_ids:
-            continue
-
-        trigger_price = buy_prices_by_token_id.get(market.yes_token_id)
-
-        if trigger_price is None or trigger_price <= config.entry_price_threshold:
-            continue
-
-        candidates.append((market, trigger_price))
-
-    candidates.sort(key=lambda item: item[1], reverse=True)
-    return candidates[:config.max_entry_markets_per_event]
-
-
-def parse_raw_balance_amount(value: Any) -> Optional[float]:
-    if isinstance(value, bool):
-        return None
-
-    if isinstance(value, int):
-        return float(Decimal(value) / CONDITIONAL_TOKEN_DECIMAL_FACTOR)
-
-    if isinstance(value, float):
-        return value
-
-    if isinstance(value, str):
-        text = value.strip()
-
-        if not text:
-            return None
-
-        if "." in text:
-            return float(text)
-
-        return float(parse_decimal_text(text) / CONDITIONAL_TOKEN_DECIMAL_FACTOR)
-
-    return None
-
-
-def extract_balance_from_response(response: Any, token_id: str) -> float:
-    if isinstance(response, dict):
-        if token_id in response:
-            direct_token_balance = parse_raw_balance_amount(response.get(token_id))
-
-            if direct_token_balance is not None:
-                return direct_token_balance
-
-        for key in BALANCE_RESPONSE_KEYS:
-            if key not in response:
-                continue
-
-            balance = parse_raw_balance_amount(response.get(key))
-
-            if balance is not None:
-                return balance
-
-        for value in response.values():
-            if isinstance(value, (dict, list)):
-                nested_balance = extract_balance_from_response(value, token_id)
-
-                if nested_balance > 0:
-                    return nested_balance
-
-    if isinstance(response, list):
-        for item in response:
-            nested_balance = extract_balance_from_response(item, token_id)
-
-            if nested_balance > 0:
-                return nested_balance
-
-    return 0.0
-
-
-def get_yes_share_balance(client: ClobClient, market: TemperatureMarket) -> tuple[float, Any]:
-    response = client.get_balance_allowance(
-        BalanceAllowanceParams(
-            asset_type=AssetType.CONDITIONAL,
-            token_id=market.yes_token_id,
-        )
+    outcome_token_id = get_market_outcome_token_id(ranked_market.market, target_outcome)
+    log_json(
+        logger,
+        "order_skipped_trigger_above_max",
+        {
+            "amount_usdc": buy_amount_usdc,
+            "condition_id": ranked_market.market.condition_id,
+            "event_id": snapshot.event.get("id"),
+            "event_title": snapshot.event.get("title"),
+            "market_id": ranked_market.market.market_id,
+            "market_rank": ranked_market.rank,
+            "max_buy_price": max_buy_price,
+            "question": ranked_market.market.question,
+            "side": BUY_SIDE,
+            "target_date": snapshot.target_date,
+            "target_outcome": target_outcome,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "trigger_price": ranked_market.outcome_price,
+            "outcome_token_id": outcome_token_id,
+        },
     )
-    return extract_balance_from_response(response, market.yes_token_id), response
 
 
-def get_exit_price_for_market(
+def calculate_required_market_price(
     client: ClobClient,
     market: TemperatureMarket,
-    requested_price: Decimal,
-) -> Decimal:
-    tick_size = get_market_tick_size(client, market)
-
-    if requested_price < tick_size:
-        return tick_size
-
-    if requested_price > Decimal("1") - tick_size:
-        return Decimal("1") - tick_size
-
-    return requested_price
+    target_outcome: str,
+    buy_amount_usdc: float,
+) -> float:
+    return client.calculate_market_price(
+        get_market_outcome_token_id(market, target_outcome),
+        BUY_SIDE,
+        buy_amount_usdc,
+        MARKET_ORDER_TYPE,
+    )
 
 
-def sell_yes_shares(
+def build_order_args(
+    market: TemperatureMarket,
+    target_outcome: str,
+    buy_amount_usdc: float,
+    max_buy_price: float,
+) -> MarketOrderArgsV2:
+    return MarketOrderArgsV2(
+        token_id=get_market_outcome_token_id(market, target_outcome),
+        amount=buy_amount_usdc,
+        side=BUY_SIDE,
+        price=max_buy_price,
+        order_type=MARKET_ORDER_TYPE,
+    )
+
+
+def buy_ranked_outcome_market(
     client: ClobClient,
     logger: logging.Logger,
-    market: TemperatureMarket,
-    requested_min_sell_price: Decimal,
-    reason: str,
+    snapshot: MarketSnapshot,
+    ranked_market: RankedMarket,
+    target_outcome: str,
+    buy_amount_usdc: float,
+    max_buy_price: float,
 ) -> Optional[dict[str, Any]]:
-    balance, raw_balance_response = get_yes_share_balance(client, market)
+    outcome_token_id = get_market_outcome_token_id(ranked_market.market, target_outcome)
 
-    if balance <= MIN_POSITION_TO_SELL:
-        log_json(
-            logger,
-            "sell_skipped_no_position",
-            {
-                "market_id": market.market_id,
-                "question": market.question,
-                "raw_balance_response": raw_balance_response,
-                "reason": reason,
-                "yes_balance": balance,
-                "yes_token_id": market.yes_token_id,
-            },
+    if ranked_market.outcome_price > max_buy_price:
+        log_order_skipped_trigger_above_max(
+            logger=logger,
+            snapshot=snapshot,
+            ranked_market=ranked_market,
+            target_outcome=target_outcome,
+            buy_amount_usdc=buy_amount_usdc,
+            max_buy_price=max_buy_price,
         )
         return None
 
-    min_sell_price = get_exit_price_for_market(client, market, requested_min_sell_price)
-    order_args = MarketOrderArgsV2(
-        token_id=market.yes_token_id,
-        amount=balance,
-        side=SELL_SIDE,
-        price=decimal_price_to_float(min_sell_price),
-        order_type=MARKET_SELL_ORDER_TYPE,
+    try:
+        required_price = calculate_required_market_price(
+            client=client,
+            market=ranked_market.market,
+            target_outcome=target_outcome,
+            buy_amount_usdc=buy_amount_usdc,
+        )
+    except Exception as error:
+        no_match_reason = get_clob_no_match_reason(error, BUY_SIDE)
+
+        if no_match_reason is None:
+            raise
+
+        log_order_skipped_no_liquidity(
+            logger=logger,
+            snapshot=snapshot,
+            ranked_market=ranked_market,
+            target_outcome=target_outcome,
+            buy_amount_usdc=buy_amount_usdc,
+            max_buy_price=max_buy_price,
+            reason=no_match_reason,
+            error=error,
+        )
+        return None
+
+    if required_price > max_buy_price:
+        log_order_skipped_price_above_max(
+            logger=logger,
+            snapshot=snapshot,
+            ranked_market=ranked_market,
+            target_outcome=target_outcome,
+            required_price=required_price,
+            buy_amount_usdc=buy_amount_usdc,
+            max_buy_price=max_buy_price,
+        )
+        return None
+
+    order_args = build_order_args(
+        market=ranked_market.market,
+        target_outcome=target_outcome,
+        buy_amount_usdc=buy_amount_usdc,
+        max_buy_price=max_buy_price,
     )
 
     log_json(
         logger,
-        "sell_order_attempt",
+        "order_attempt",
         {
-            "event_id": market.event_id,
-            "market_id": market.market_id,
-            "min_sell_price": decimal_price_to_log(min_sell_price),
-            "order_type": MARKET_SELL_ORDER_TYPE,
-            "question": market.question,
-            "reason": reason,
-            "side": SELL_SIDE,
-            "yes_balance": balance,
-            "yes_token_id": market.yes_token_id,
+            "amount_usdc": buy_amount_usdc,
+            "condition_id": ranked_market.market.condition_id,
+            "event_id": snapshot.event.get("id"),
+            "event_title": snapshot.event.get("title"),
+            "market_id": ranked_market.market.market_id,
+            "market_order_type": MARKET_ORDER_TYPE,
+            "market_rank": ranked_market.rank,
+            "max_buy_price": max_buy_price,
+            "question": ranked_market.market.question,
+            "required_price": required_price,
+            "side": BUY_SIDE,
+            "target_date": snapshot.target_date,
+            "target_outcome": target_outcome,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "trigger_price": ranked_market.outcome_price,
+            "outcome_token_id": outcome_token_id,
         },
     )
 
     response = client.create_and_post_market_order(
         order_args,
-        order_type=MARKET_SELL_ORDER_TYPE,
+        order_type=MARKET_ORDER_TYPE,
     )
     payload = response if isinstance(response, dict) else {"response": response}
-    log_json(logger, "sell_order_response", payload)
+    log_json(logger, "order_response", payload)
     return payload
 
 
-def cancel_market_orders(
-    client: ClobClient,
-    logger: logging.Logger,
-    market: TemperatureMarket,
-    reason: str,
-) -> Optional[dict[str, Any]]:
-    log_json(
-        logger,
-        "cancel_market_orders_attempt",
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return build_empty_state()
+
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return build_empty_state()
+
+    if not isinstance(state, dict):
+        return build_empty_state()
+
+    state.setdefault("processed_order_keys", [])
+    state.setdefault("processed_records", [])
+    state.setdefault("active_position", None)
+    return state
+
+
+def build_empty_state() -> dict[str, Any]:
+    return {
+        "active_position": None,
+        "processed_order_keys": [],
+        "processed_records": [],
+    }
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def build_buy_order_key(target_date: str, schedule: TradeSchedule, target_outcome: str) -> str:
+    return (
+        f"{target_date}:buy_day_offset={schedule.buy_day_offset}:buy_hour={schedule.buy_hour_utc}:"
+        f"rank={TARGET_MARKET_RANK}:side={target_outcome}"
+    )
+
+
+def build_sell_order_key(target_date: str, schedule: TradeSchedule, target_outcome: str) -> str:
+    return (
+        f"{target_date}:sell_day_offset={schedule.sell_day_offset}:sell_hour={schedule.sell_hour_utc}:"
+        f"rank={TARGET_MARKET_RANK}:side={target_outcome}"
+    )
+
+
+def build_buy_slice_order_key(
+    target_date: str,
+    schedule: TradeSchedule,
+    target_outcome: str,
+    slice_number: int,
+) -> str:
+    return f"{build_buy_order_key(target_date, schedule, target_outcome)}:slice={slice_number}"
+
+
+def build_sell_slice_order_key(
+    target_date: str,
+    schedule: TradeSchedule,
+    target_outcome: str,
+    slice_number: int,
+) -> str:
+    return f"{build_sell_order_key(target_date, schedule, target_outcome)}:slice={slice_number}"
+
+
+def is_order_key_processed(state: dict[str, Any], order_key: str) -> bool:
+    processed_order_keys = state.get("processed_order_keys", [])
+    return isinstance(processed_order_keys, list) and order_key in processed_order_keys
+
+
+def mark_order_key_processed(
+    state: dict[str, Any],
+    order_key: str,
+    status: str,
+    payload: dict[str, Any],
+) -> None:
+    processed_order_keys = state.setdefault("processed_order_keys", [])
+    processed_records = state.setdefault("processed_records", [])
+
+    if order_key not in processed_order_keys:
+        processed_order_keys.append(order_key)
+
+    processed_records.append(
         {
-            "condition_id": market.condition_id,
-            "market_id": market.market_id,
-            "question": market.question,
-            "reason": reason,
-            "yes_token_id": market.yes_token_id,
-        },
+            "order_key": order_key,
+            "payload": payload,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+        }
     )
-    response = client.cancel_market_orders(
-        OrderMarketCancelParams(
-            market=market.condition_id,
-            asset_id=market.yes_token_id,
-        )
-    )
-    payload = response if isinstance(response, dict) else {"response": response}
-    log_json(logger, "cancel_market_orders_response", payload)
-    return payload
+    save_state(state)
 
 
-def safe_cancel_market_orders(
-    client: ClobClient,
+def get_active_position(state: dict[str, Any]) -> Optional[dict[str, Any]]:
+    active_position = state.get("active_position")
+
+    if isinstance(active_position, dict):
+        return active_position
+
+    return None
+
+
+def set_active_position(state: dict[str, Any], position: dict[str, Any]) -> None:
+    state["active_position"] = position
+    save_state(state)
+
+
+def save_active_position(state: dict[str, Any], position: dict[str, Any]) -> None:
+    state["active_position"] = position
+    save_state(state)
+
+
+def clear_active_position(state: dict[str, Any]) -> None:
+    state["active_position"] = None
+    save_state(state)
+
+
+def wait_for_buy_window(
+    buy_time: datetime,
+    snapshot_grace_seconds: int,
     logger: logging.Logger,
-    market: TemperatureMarket,
-    reason: str,
-) -> None:
-    try:
-        cancel_market_orders(client, logger, market, reason)
-    except Exception as error:
-        logger.exception("cancel_market_orders_error %s", error)
-
-
-def safe_sell_yes_shares(
-    client: ClobClient,
-    logger: logging.Logger,
-    market: TemperatureMarket,
-    requested_min_sell_price: Decimal,
-    reason: str,
-) -> None:
-    try:
-        sell_yes_shares(client, logger, market, requested_min_sell_price, reason)
-    except Exception as error:
-        logger.exception("sell_order_error %s", error)
-
-
-def handle_event_cutoff(
-    client: ClobClient,
-    logger: logging.Logger,
-    state: RuntimeState,
-    config: StrategyConfig,
-    event: TemperatureEvent,
-    now: datetime,
 ) -> bool:
-    if event.event_id in state.cutoff_event_ids:
-        return True
+    buy_deadline = buy_time + timedelta(seconds=snapshot_grace_seconds)
 
-    if now < event.cutoff_time:
-        return False
+    while True:
+        now = datetime.now(timezone.utc)
 
-    log_json(
-        logger,
-        "event_cutoff_triggered",
-        {
-            "cutoff_time": event.cutoff_time.isoformat(),
-            "event_id": event.event_id,
-            "now": now.isoformat(),
-            "title": event.title,
-        },
-    )
-
-    for market in event.markets:
-        safe_cancel_market_orders(client, logger, market, "event_cutoff")
-        safe_sell_yes_shares(
-            client,
-            logger,
-            market,
-            config.force_exit_min_sell_price,
-            "event_cutoff",
-        )
-        state.deactivated_market_ids.add(market.market_id)
-        state.posted_order_prices_by_market.pop(market.market_id, None)
-        state.low_price_started_at_by_market.pop(market.market_id, None)
-
-    state.cutoff_event_ids.add(event.event_id)
-    return True
-
-
-def handle_take_profit(
-    client: ClobClient,
-    logger: logging.Logger,
-    config: StrategyConfig,
-    market: TemperatureMarket,
-    sell_price: Optional[float],
-) -> None:
-    if sell_price is None or sell_price <= config.take_profit_price:
-        return
-
-    sell_yes_shares(
-        client,
-        logger,
-        market,
-        Decimal(str(config.take_profit_price)),
-        "take_profit",
-    )
-
-
-def handle_sustained_low_exit(
-    client: ClobClient,
-    logger: logging.Logger,
-    state: RuntimeState,
-    config: StrategyConfig,
-    market: TemperatureMarket,
-    sell_price: Optional[float],
-    now: datetime,
-) -> None:
-    if sell_price is None:
-        return
-
-    if sell_price >= config.low_exit_price:
-        started_at = state.low_price_started_at_by_market.pop(market.market_id, None)
-
-        if started_at is not None:
+        if now < buy_time:
+            seconds_until_buy = (buy_time - now).total_seconds()
             log_json(
                 logger,
-                "low_price_cleared",
+                "buy_wait",
                 {
-                    "elapsed_seconds": (now - started_at).total_seconds(),
-                    "market_id": market.market_id,
-                    "question": market.question,
-                    "yes_sell_price": sell_price,
+                    "buy_time": buy_time.isoformat(),
+                    "seconds_until_buy": round(seconds_until_buy, 3),
+                },
+            )
+            time.sleep(min(seconds_until_buy, 60))
+            continue
+
+        if now > buy_deadline:
+            log_json(
+                logger,
+                "buy_window_missed",
+                {
+                    "buy_deadline": buy_deadline.isoformat(),
+                    "buy_time": buy_time.isoformat(),
+                    "now": now.isoformat(),
+                    "snapshot_grace_seconds": snapshot_grace_seconds,
+                },
+            )
+            return False
+
+        return True
+
+
+def wait_until_sell_time(sell_time: datetime, logger: logging.Logger) -> None:
+    while True:
+        now = datetime.now(timezone.utc)
+
+        if now >= sell_time:
+            return
+
+        seconds_until_sell = (sell_time - now).total_seconds()
+        log_json(
+            logger,
+            "sell_wait",
+            {
+                "seconds_until_sell": round(seconds_until_sell, 3),
+                "sell_time": sell_time.isoformat(),
+            },
+        )
+        time.sleep(min(seconds_until_sell, 60))
+
+
+def sleep_after_processed_date(
+    target_date: str,
+    logger: logging.Logger,
+    poll_interval_seconds: int,
+) -> None:
+    if os.getenv(TARGET_MARKET_DATE_ENV):
+        time.sleep(poll_interval_seconds)
+        return
+
+    market_timezone = get_market_timezone()
+    now = datetime.now(market_timezone)
+    tomorrow = now.date() + timedelta(days=1)
+    next_check = datetime.combine(
+        tomorrow,
+        datetime_time(hour=0, minute=1),
+        tzinfo=market_timezone,
+    )
+    seconds_until_next_check = max(
+        poll_interval_seconds,
+        int((next_check - now).total_seconds()),
+    )
+    log_json(
+        logger,
+        "next_market_date_wait",
+        {
+            "seconds_until_next_check": seconds_until_next_check,
+            "target_date": target_date,
+        },
+    )
+    time.sleep(seconds_until_next_check)
+
+
+def build_position_record(
+    snapshot: MarketSnapshot,
+    ranked_market: RankedMarket,
+    target_outcome: str,
+    schedule: TradeSchedule,
+    twap_config: TwapConfig,
+    buy_amount_usdc: float,
+    max_buy_price: float,
+) -> dict[str, Any]:
+    outcome_token_id = get_market_outcome_token_id(ranked_market.market, target_outcome)
+
+    return {
+        "buy_amount_usdc": buy_amount_usdc,
+        "buy_order_responses": [],
+        "buy_twap_complete": False,
+        "completed_buy_slices": [],
+        "buy_price": ranked_market.outcome_price,
+        "condition_id": ranked_market.market.condition_id,
+        "event_id": snapshot.event.get("id"),
+        "event_title": snapshot.event.get("title"),
+        "market_id": ranked_market.market.market_id,
+        "market_rank": ranked_market.rank,
+        "max_buy_price": max_buy_price,
+        "no_token_id": ranked_market.market.no_token_id,
+        "outcome_token_id": outcome_token_id,
+        "question": ranked_market.market.question,
+        "schedule": build_schedule_record(schedule),
+        "target_outcome": target_outcome,
+        "target_date": snapshot.target_date,
+        "temperature_celsius": ranked_market.market.temperature_celsius,
+        "trade_times": build_trade_times_record(snapshot.target_date, schedule),
+        "twap": build_twap_config_record(twap_config),
+        "yes_token_id": ranked_market.market.yes_token_id,
+    }
+
+
+def build_market_snapshot_from_position(position: dict[str, Any]) -> MarketSnapshot:
+    return MarketSnapshot(
+        target_date=str(position.get("target_date") or ""),
+        event={
+            "id": position.get("event_id"),
+            "title": position.get("event_title"),
+        },
+        markets=[build_temperature_market_from_position(position)],
+    )
+
+
+def build_ranked_market_from_position(position: dict[str, Any]) -> RankedMarket:
+    return RankedMarket(
+        market=build_temperature_market_from_position(position),
+        outcome_price=float(position.get("buy_price") or 0.0),
+        rank=int(position.get("market_rank") or TARGET_MARKET_RANK),
+    )
+
+
+def build_temperature_market_from_position(position: dict[str, Any]) -> TemperatureMarket:
+    return TemperatureMarket(
+        market_id=str(position.get("market_id") or ""),
+        condition_id=str(position.get("condition_id") or ""),
+        question=str(position.get("question") or ""),
+        slug=str(position.get("market_slug") or ""),
+        group_item_title=str(position.get("group_item_title") or ""),
+        temperature_celsius=int(position.get("temperature_celsius") or 0),
+        yes_token_id=str(position.get("yes_token_id") or ""),
+        no_token_id=str(position.get("no_token_id") or ""),
+    )
+
+
+def get_position_target_outcome(position: dict[str, Any]) -> str:
+    target_outcome = position.get("target_outcome")
+
+    if isinstance(target_outcome, str) and target_outcome.strip():
+        return normalize_target_outcome(target_outcome)
+
+    return YES_OUTCOME
+
+
+def get_position_outcome_token_id(position: dict[str, Any]) -> str:
+    outcome_token_id = position.get("outcome_token_id")
+
+    if isinstance(outcome_token_id, str) and outcome_token_id:
+        return outcome_token_id
+
+    target_outcome = get_position_target_outcome(position)
+
+    if target_outcome == NO_OUTCOME:
+        no_token_id = position.get("no_token_id")
+
+        if isinstance(no_token_id, str) and no_token_id:
+            return no_token_id
+
+        raise ValueError("Active position is missing a NO outcome token id.")
+
+    yes_token_id = position.get("yes_token_id")
+
+    if isinstance(yes_token_id, str) and yes_token_id:
+        return yes_token_id
+
+    raise ValueError("Active position is missing a YES outcome token id.")
+
+
+def append_completed_slice(position: dict[str, Any], field_name: str, slice_number: int) -> None:
+    completed_slices = position.setdefault(field_name, [])
+
+    if isinstance(completed_slices, list) and slice_number not in completed_slices:
+        completed_slices.append(slice_number)
+
+
+def append_buy_order_response(
+    position: dict[str, Any],
+    slice_number: int,
+    order_response: dict[str, Any],
+) -> None:
+    order_responses = position.setdefault("buy_order_responses", [])
+
+    if isinstance(order_responses, list):
+        order_responses.append(
+            {
+                "order_response": order_response,
+                "slice_number": slice_number,
+            }
+        )
+
+
+def get_int_list(value: Any) -> list[int]:
+    if not isinstance(value, list):
+        return []
+
+    int_values: list[int] = []
+    for item in value:
+        try:
+            int_values.append(int(item))
+        except (TypeError, ValueError):
+            continue
+
+    return int_values
+
+
+def count_unprocessed_sell_slices(
+    state: dict[str, Any],
+    target_date: str,
+    schedule: TradeSchedule,
+    target_outcome: str,
+    twap_config: TwapConfig,
+    current_slice_number: int,
+) -> int:
+    remaining_slices = 0
+
+    for slice_number in range(current_slice_number, twap_config.sell_slices + 1):
+        sell_slice_key = build_sell_slice_order_key(
+            target_date,
+            schedule,
+            target_outcome,
+            slice_number,
+        )
+
+        if not is_order_key_processed(state, sell_slice_key):
+            remaining_slices += 1
+
+    return max(remaining_slices, 1)
+
+
+def sleep_between_twap_slices(interval_seconds: int, logger: logging.Logger, payload: dict[str, Any]) -> None:
+    if interval_seconds <= 0:
+        return
+
+    log_json(
+        logger,
+        "twap_slice_wait",
+        {
+            **payload,
+            "interval_seconds": interval_seconds,
+        },
+    )
+    time.sleep(interval_seconds)
+
+
+def execute_buy_twap(
+    client: ClobClient,
+    logger: logging.Logger,
+    state: dict[str, Any],
+    target_date: str,
+    target_outcome: str,
+    schedule: TradeSchedule,
+    twap_config: TwapConfig,
+    buy_amount_usdc: float,
+    max_buy_price: float,
+) -> bool:
+    active_position = get_active_position(state)
+
+    if active_position is not None:
+        target_outcome = get_position_target_outcome(active_position)
+
+    order_key = build_buy_order_key(target_date, schedule, target_outcome)
+
+    if active_position is None:
+        snapshot = load_market_snapshot(target_date, logger)
+        prices_by_token_id = get_outcome_prices(client, snapshot.markets, target_outcome)
+        ranked_markets = rank_markets_by_outcome_price(
+            snapshot.markets,
+            prices_by_token_id,
+            target_outcome,
+        )
+        price_snapshot = build_price_snapshot(ranked_markets, target_outcome)
+
+        log_json(
+            logger,
+            "ranked_prices_polled",
+            {
+                "event_id": snapshot.event.get("id"),
+                "market_count": len(snapshot.markets),
+                "priced_market_count": len(ranked_markets),
+                "prices": price_snapshot,
+                "schedule": build_schedule_record(schedule),
+                "target_outcome": target_outcome,
+                "target_date": target_date,
+                "target_market_rank": TARGET_MARKET_RANK,
+            },
+        )
+
+        if len(ranked_markets) < TARGET_MARKET_RANK:
+            log_json(
+                logger,
+                "order_skipped_not_enough_priced_markets",
+                {
+                    "priced_market_count": len(ranked_markets),
+                    "target_outcome": target_outcome,
+                    "target_market_rank": TARGET_MARKET_RANK,
+                },
+            )
+            return False
+
+        ranked_market = ranked_markets[TARGET_MARKET_RANK - 1]
+        active_position = build_position_record(
+            snapshot=snapshot,
+            ranked_market=ranked_market,
+            target_outcome=target_outcome,
+            schedule=schedule,
+            twap_config=twap_config,
+            buy_amount_usdc=buy_amount_usdc,
+            max_buy_price=max_buy_price,
+        )
+        set_active_position(state, active_position)
+        outcome_token_id = get_market_outcome_token_id(ranked_market.market, target_outcome)
+    else:
+        snapshot = build_market_snapshot_from_position(active_position)
+        ranked_market = build_ranked_market_from_position(active_position)
+        outcome_token_id = get_position_outcome_token_id(active_position)
+        log_json(
+            logger,
+            "buy_twap_resumed",
+            {
+                "completed_buy_slices": get_int_list(active_position.get("completed_buy_slices")),
+                "market_id": ranked_market.market.market_id,
+                "market_rank": ranked_market.rank,
+                "outcome_token_id": outcome_token_id,
+                "schedule": build_schedule_record(schedule),
+                "target_outcome": target_outcome,
+                "target_date": target_date,
+                "twap": build_twap_config_record(twap_config),
+            },
+        )
+
+    log_json(
+        logger,
+        "ranked_market_selected",
+        {
+            "event_id": snapshot.event.get("id"),
+            "market_id": ranked_market.market.market_id,
+            "market_rank": ranked_market.rank,
+            "outcome_price": ranked_market.outcome_price,
+            "outcome_token_id": outcome_token_id,
+            "question": ranked_market.market.question,
+            "schedule": build_schedule_record(schedule),
+            "target_outcome": target_outcome,
+            "target_date": target_date,
+            "temperature_celsius": ranked_market.market.temperature_celsius,
+            "twap": build_twap_config_record(twap_config),
+        },
+    )
+
+    buy_slice_amount_usdc = build_buy_slice_amount_usdc(buy_amount_usdc, twap_config)
+    attempted_slice_in_this_call = False
+
+    for slice_number in range(1, twap_config.buy_slices + 1):
+        buy_slice_key = build_buy_slice_order_key(
+            target_date,
+            schedule,
+            target_outcome,
+            slice_number,
+        )
+
+        if is_order_key_processed(state, buy_slice_key):
+            continue
+
+        if attempted_slice_in_this_call:
+            sleep_between_twap_slices(
+                twap_config.buy_interval_seconds,
+                logger,
+                {
+                    "side": BUY_SIDE,
+                    "target_outcome": target_outcome,
+                    "target_date": target_date,
+                    "next_slice_number": slice_number,
+                    "total_slices": twap_config.buy_slices,
                 },
             )
 
-        return
-
-    started_at = state.low_price_started_at_by_market.get(market.market_id)
-
-    if started_at is None:
-        state.low_price_started_at_by_market[market.market_id] = now
+        twap_slice = build_twap_slice_record(BUY_SIDE, slice_number, twap_config.buy_slices)
         log_json(
             logger,
-            "low_price_started",
+            "buy_twap_slice_started",
             {
-                "low_exit_price": config.low_exit_price,
-                "low_exit_seconds": config.low_exit_seconds,
-                "market_id": market.market_id,
-                "question": market.question,
-                "started_at": now.isoformat(),
-                "yes_sell_price": sell_price,
+                "amount_usdc": buy_slice_amount_usdc,
+                "market_id": ranked_market.market.market_id,
+                "market_rank": ranked_market.rank,
+                "outcome_token_id": outcome_token_id,
+                "target_outcome": target_outcome,
+                "target_date": target_date,
+                "twap_slice": twap_slice,
             },
         )
-        return
+        attempted_slice_in_this_call = True
 
-    elapsed_seconds = (now - started_at).total_seconds()
+        order_response = buy_ranked_outcome_market(
+            client=client,
+            logger=logger,
+            snapshot=snapshot,
+            ranked_market=ranked_market,
+            target_outcome=target_outcome,
+            buy_amount_usdc=buy_slice_amount_usdc,
+            max_buy_price=max_buy_price,
+        )
 
-    log_json(
-        logger,
-        "low_price_continued",
-        {
-            "elapsed_seconds": elapsed_seconds,
-            "low_exit_price": config.low_exit_price,
-            "low_exit_seconds": config.low_exit_seconds,
-            "market_id": market.market_id,
-            "question": market.question,
-            "started_at": started_at.isoformat(),
-            "yes_sell_price": sell_price,
-        },
-    )
-
-    if elapsed_seconds < config.low_exit_seconds:
-        return
-
-    log_json(
-        logger,
-        "low_price_exit_triggered",
-        {
-            "elapsed_seconds": elapsed_seconds,
-            "low_exit_price": config.low_exit_price,
-            "market_id": market.market_id,
-            "question": market.question,
-            "yes_sell_price": sell_price,
-        },
-    )
-
-    safe_cancel_market_orders(client, logger, market, "sustained_low_price")
-    safe_sell_yes_shares(
-        client,
-        logger,
-        market,
-        config.force_exit_min_sell_price,
-        "sustained_low_price",
-    )
-    state.deactivated_market_ids.add(market.market_id)
-    state.posted_order_prices_by_market.pop(market.market_id, None)
-    state.low_price_started_at_by_market.pop(market.market_id, None)
-
-
-def merge_unique_markets(markets: list[TemperatureMarket]) -> list[TemperatureMarket]:
-    unique_markets: dict[str, TemperatureMarket] = {}
-
-    for market in markets:
-        unique_markets[market.market_id] = market
-
-    return list(unique_markets.values())
-
-
-def refresh_events_if_needed(
-    logger: logging.Logger,
-    state: RuntimeState,
-    config: StrategyConfig,
-    now: datetime,
-) -> None:
-    if state.events and now < state.next_market_refresh_time:
-        return
-
-    events = load_temperature_events(logger)
-    state.events = events
-    state.markets_by_id.update(
-        {
-            market.market_id: market
-            for event in events
-            for market in event.markets
+        status = "buy_slice_order_posted" if order_response is not None else "buy_slice_order_skipped"
+        payload = {
+            "amount_usdc": buy_slice_amount_usdc,
+            "market_id": ranked_market.market.market_id,
+            "market_rank": ranked_market.rank,
+            "outcome_price": ranked_market.outcome_price,
+            "outcome_token_id": outcome_token_id,
+            "schedule": build_schedule_record(schedule),
+            "target_outcome": target_outcome,
+            "target_date": target_date,
+            "twap_slice": twap_slice,
         }
-    )
-    state.next_market_refresh_time = now + timedelta(
-        seconds=config.market_refresh_interval_seconds
-    )
 
-    log_json(
-        logger,
-        "next_market_refresh_scheduled",
-        {"next_market_refresh_time": state.next_market_refresh_time.isoformat()},
-    )
+        if order_response is not None:
+            payload["order_response"] = order_response
+            append_buy_order_response(active_position, slice_number, order_response)
 
+        append_completed_slice(active_position, "completed_buy_slices", slice_number)
+        mark_order_key_processed(
+            state=state,
+            order_key=buy_slice_key,
+            status=status,
+            payload=payload,
+        )
+        save_active_position(state, active_position)
 
-def get_monitor_markets(state: RuntimeState) -> list[TemperatureMarket]:
-    markets = []
-
-    for market_id in state.posted_order_prices_by_market:
-        market = state.markets_by_id.get(market_id)
-
-        if market is not None:
-            markets.append(market)
-
-    return markets
-
-
-def run_price_cycle(
-    client: ClobClient,
-    logger: logging.Logger,
-    state: RuntimeState,
-    config: StrategyConfig,
-) -> None:
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    refresh_events_if_needed(logger, state, config, now)
-
-    for event in state.events:
-        handle_event_cutoff(client, logger, state, config, event, now)
-
-    active_events = [
-        event
-        for event in state.events
-        if event.event_id not in state.cutoff_event_ids and now < event.cutoff_time
-    ]
-    tradeable_markets = [
-        market
-        for event in active_events
-        for market in get_tradeable_markets(event)
-    ]
-    monitor_markets = get_monitor_markets(state)
-    price_markets = merge_unique_markets(tradeable_markets + monitor_markets)
-    buy_prices_by_token_id = get_yes_side_prices(client, price_markets, BUY_SIDE)
-    sell_prices_by_token_id = get_yes_side_prices(client, price_markets, SELL_SIDE)
-
-    log_json(
-        logger,
-        "prices_polled",
-        {
-            "market_count": len(price_markets),
-            "prices": build_price_snapshot(
-                price_markets,
-                buy_prices_by_token_id,
-                sell_prices_by_token_id,
-            ),
+    active_position["buy_twap_complete"] = True
+    save_active_position(state, active_position)
+    posted_buy_responses = active_position.get("buy_order_responses", [])
+    status = "buy_twap_complete" if posted_buy_responses else "buy_twap_skipped"
+    mark_order_key_processed(
+        state=state,
+        order_key=order_key,
+        status=status,
+        payload={
+            "completed_buy_slices": get_int_list(active_position.get("completed_buy_slices")),
+            "market_id": ranked_market.market.market_id,
+            "market_rank": ranked_market.rank,
+            "outcome_token_id": outcome_token_id,
+            "posted_buy_slice_count": len(posted_buy_responses) if isinstance(posted_buy_responses, list) else 0,
+            "schedule": build_schedule_record(schedule),
+            "target_outcome": target_outcome,
+            "target_date": target_date,
+            "twap": build_twap_config_record(twap_config),
         },
     )
 
-    for event in active_events:
-        selected_markets = select_entry_markets_for_event(
-            event,
-            buy_prices_by_token_id,
-            config,
-            state.deactivated_market_ids,
-        )
+    if not posted_buy_responses:
+        clear_active_position(state)
 
-        log_json(
-            logger,
-            "entry_markets_selected",
-            {
-                "entry_price_threshold": config.entry_price_threshold,
-                "event_id": event.event_id,
-                "selected": [
-                    {
-                        "market_id": market.market_id,
-                        "question": market.question,
-                        "yes_buy_price": trigger_price,
-                    }
-                    for market, trigger_price in selected_markets
-                ],
-                "title": event.title,
-            },
-        )
+    return True
 
-        for market, trigger_price in selected_markets:
-            ensure_limit_orders_for_market(
-                client,
-                logger,
-                state,
-                config,
-                market,
-                trigger_price,
-            )
 
-    for market in get_monitor_markets(state):
-        if market.market_id in state.deactivated_market_ids:
+def parse_balance_amount(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+
+    if isinstance(value, int):
+        return float(value) / CONDITIONAL_TOKEN_DECIMAL_SCALE
+
+    if isinstance(value, float):
+        return float(value)
+
+    if isinstance(value, str):
+        clean_value = value.strip()
+
+        if clean_value == "":
+            return None
+
+        if "." in clean_value:
+            return float(clean_value)
+
+        return float(int(clean_value)) / CONDITIONAL_TOKEN_DECIMAL_SCALE
+
+    return None
+
+
+def extract_balance_amount(response_json: Any) -> Optional[float]:
+    direct_balance = parse_balance_amount(response_json)
+
+    if direct_balance is not None:
+        return direct_balance
+
+    if not isinstance(response_json, dict):
+        return None
+
+    for field_name in BALANCE_RESPONSE_VALUE_KEYS:
+        if field_name not in response_json:
             continue
 
-        sell_price = sell_prices_by_token_id.get(market.yes_token_id)
-        handle_take_profit(client, logger, config, market, sell_price)
-        handle_sustained_low_exit(client, logger, state, config, market, sell_price, now)
+        balance = parse_balance_amount(response_json.get(field_name))
+
+        if balance is not None:
+            return balance
+
+    return None
 
 
-def build_initial_state() -> RuntimeState:
-    return RuntimeState(
-        events=[],
-        markets_by_id={},
-        next_market_refresh_time=MIN_UTC_TIME,
-        posted_order_prices_by_market={},
-        low_price_started_at_by_market={},
-        deactivated_market_ids=set(),
-        cutoff_event_ids=set(),
+def get_conditional_token_balance(client: ClobClient, token_id: str) -> tuple[float, Any]:
+    response = client.get_balance_allowance(
+        BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+        )
+    )
+    balance = extract_balance_amount(response)
+
+    if balance is None:
+        raise ValueError(f"Could not parse conditional token balance for token {token_id}.")
+
+    return balance, response
+
+
+def round_sell_shares(shares: float) -> float:
+    return math.floor(shares * 100.0) / 100.0
+
+
+def build_sell_order_args(token_id: str, shares: float, min_sell_price: float) -> MarketOrderArgsV2:
+    return MarketOrderArgsV2(
+        token_id=token_id,
+        amount=shares,
+        side=SELL_SIDE,
+        price=min_sell_price,
+        order_type=MARKET_ORDER_TYPE,
     )
 
 
-def sleep_until_next_cycle(seconds: int) -> None:
-    time.sleep(seconds)
+def sell_active_position(
+    client: ClobClient,
+    logger: logging.Logger,
+    state: dict[str, Any],
+    position: dict[str, Any],
+    schedule: TradeSchedule,
+    twap_config: TwapConfig,
+    min_sell_price: float,
+) -> bool:
+    target_outcome = get_position_target_outcome(position)
+    token_id = get_position_outcome_token_id(position)
+    target_date = str(position["target_date"])
+    sell_order_key = build_sell_order_key(target_date, schedule, target_outcome)
+
+    if is_order_key_processed(state, sell_order_key):
+        log_json(
+            logger,
+            "sell_skipped_already_processed",
+            {
+                "order_key": sell_order_key,
+                "target_outcome": target_outcome,
+            },
+        )
+        clear_active_position(state)
+        return True
+
+    attempted_slice_in_this_call = False
+
+    for slice_number in range(1, twap_config.sell_slices + 1):
+        sell_slice_key = build_sell_slice_order_key(
+            target_date,
+            schedule,
+            target_outcome,
+            slice_number,
+        )
+
+        if is_order_key_processed(state, sell_slice_key):
+            continue
+
+        if attempted_slice_in_this_call:
+            sleep_between_twap_slices(
+                twap_config.sell_interval_seconds,
+                logger,
+                {
+                    "side": SELL_SIDE,
+                    "target_outcome": target_outcome,
+                    "target_date": target_date,
+                    "next_slice_number": slice_number,
+                    "total_slices": twap_config.sell_slices,
+                },
+            )
+
+        remaining_slices = count_unprocessed_sell_slices(
+            state=state,
+            target_date=target_date,
+            schedule=schedule,
+            target_outcome=target_outcome,
+            twap_config=twap_config,
+            current_slice_number=slice_number,
+        )
+        token_balance, balance_response = get_conditional_token_balance(client, token_id)
+        sell_shares = round_sell_shares(token_balance / remaining_slices)
+        twap_slice = build_twap_slice_record(SELL_SIDE, slice_number, twap_config.sell_slices)
+
+        log_json(
+            logger,
+            "sell_balance_checked",
+            {
+                "balance_response": balance_response,
+                "raw_balance": token_balance,
+                "remaining_slices": remaining_slices,
+                "sell_shares": sell_shares,
+                "target_outcome": target_outcome,
+                "target_date": target_date,
+                "twap_slice": twap_slice,
+                "outcome_token_id": token_id,
+            },
+        )
+
+        if sell_shares < MIN_SELL_SHARES:
+            log_json(
+                logger,
+                "sell_skipped_no_balance",
+                {
+                    "min_sell_shares": MIN_SELL_SHARES,
+                    "sell_shares": sell_shares,
+                    "target_outcome": target_outcome,
+                    "target_date": target_date,
+                    "twap_slice": twap_slice,
+                    "outcome_token_id": token_id,
+                },
+            )
+            mark_order_key_processed(
+                state=state,
+                order_key=sell_slice_key,
+                status="sell_slice_skipped_no_balance",
+                payload={
+                    "min_sell_shares": MIN_SELL_SHARES,
+                    "sell_shares": sell_shares,
+                    "target_outcome": target_outcome,
+                    "target_date": target_date,
+                    "twap_slice": twap_slice,
+                    "outcome_token_id": token_id,
+                },
+            )
+            mark_order_key_processed(
+                state=state,
+                order_key=sell_order_key,
+                status="sell_skipped_no_balance",
+                payload={
+                    "min_sell_shares": MIN_SELL_SHARES,
+                    "sell_shares": sell_shares,
+                    "target_outcome": target_outcome,
+                    "target_date": target_date,
+                    "twap_slice": twap_slice,
+                    "outcome_token_id": token_id,
+                },
+            )
+            clear_active_position(state)
+            return True
+
+        try:
+            required_price = client.calculate_market_price(
+                token_id,
+                SELL_SIDE,
+                sell_shares,
+                MARKET_ORDER_TYPE,
+            )
+        except Exception as error:
+            no_match_reason = get_clob_no_match_reason(error, SELL_SIDE)
+
+            if no_match_reason is None:
+                raise
+
+            log_json(
+                logger,
+                "sell_skipped_no_liquidity",
+                {
+                    "error": get_error_message(error),
+                    "error_type": type(error).__name__,
+                    "reason": no_match_reason,
+                    "sell_shares": sell_shares,
+                    "side": SELL_SIDE,
+                    "target_outcome": target_outcome,
+                    "target_date": target_date,
+                    "twap_slice": twap_slice,
+                    "outcome_token_id": token_id,
+                },
+            )
+            return False
+
+        if required_price < min_sell_price:
+            log_json(
+                logger,
+                "sell_skipped_price_below_min",
+                {
+                    "min_sell_price": min_sell_price,
+                    "required_price": required_price,
+                    "sell_shares": sell_shares,
+                    "side": SELL_SIDE,
+                    "target_outcome": target_outcome,
+                    "target_date": target_date,
+                    "twap_slice": twap_slice,
+                    "outcome_token_id": token_id,
+                },
+            )
+            return False
+
+        log_json(
+            logger,
+            "sell_order_attempt",
+            {
+                "market_id": position.get("market_id"),
+                "market_order_type": MARKET_ORDER_TYPE,
+                "market_rank": position.get("market_rank"),
+                "min_sell_price": min_sell_price,
+                "question": position.get("question"),
+                "required_price": required_price,
+                "sell_shares": sell_shares,
+                "side": SELL_SIDE,
+                "target_outcome": target_outcome,
+                "target_date": target_date,
+                "twap_slice": twap_slice,
+                "outcome_token_id": token_id,
+            },
+        )
+
+        response = client.create_and_post_market_order(
+            build_sell_order_args(token_id, sell_shares, min_sell_price),
+            order_type=MARKET_ORDER_TYPE,
+        )
+        payload = response if isinstance(response, dict) else {"response": response}
+        log_json(logger, "sell_order_response", payload)
+        append_completed_slice(position, "completed_sell_slices", slice_number)
+        mark_order_key_processed(
+            state=state,
+            order_key=sell_slice_key,
+            status="sell_slice_order_posted",
+            payload={
+                "min_sell_price": min_sell_price,
+                "order_response": payload,
+                "required_price": required_price,
+                "sell_shares": sell_shares,
+                "target_outcome": target_outcome,
+                "target_date": target_date,
+                "twap_slice": twap_slice,
+                "outcome_token_id": token_id,
+            },
+        )
+        save_active_position(state, position)
+        attempted_slice_in_this_call = True
+
+    completed_sell_slices = get_int_list(position.get("completed_sell_slices"))
+    mark_order_key_processed(
+        state=state,
+        order_key=sell_order_key,
+        status="sell_twap_complete",
+        payload={
+            "completed_sell_slices": completed_sell_slices,
+            "outcome_token_id": token_id,
+            "sell_slice_count": twap_config.sell_slices,
+            "target_outcome": target_outcome,
+            "target_date": target_date,
+            "twap": build_twap_config_record(twap_config),
+        },
+    )
+    clear_active_position(state)
+    return True
+
+def run_trade_cycle(
+    client: ClobClient,
+    logger: logging.Logger,
+    state: dict[str, Any],
+    target_outcome: str,
+    schedule: TradeSchedule,
+    twap_config: TwapConfig,
+    buy_amount_usdc: float,
+    max_buy_price: float,
+    min_sell_price: float,
+    snapshot_grace_seconds: int,
+    poll_interval_seconds: int,
+) -> None:
+    active_position = get_active_position(state)
+
+    if active_position is not None:
+        target_date = str(active_position["target_date"])
+        active_target_outcome = get_position_target_outcome(active_position)
+
+        if active_position.get("buy_twap_complete") is not True:
+            executed = execute_buy_twap(
+                client=client,
+                logger=logger,
+                state=state,
+                target_date=target_date,
+                target_outcome=active_target_outcome,
+                schedule=schedule,
+                twap_config=twap_config,
+                buy_amount_usdc=buy_amount_usdc,
+                max_buy_price=max_buy_price,
+            )
+
+            if not executed:
+                time.sleep(poll_interval_seconds)
+            return
+
+        sell_time = get_position_sell_time_utc(active_position, target_date, schedule)
+        wait_until_sell_time(sell_time, logger)
+        sold = sell_active_position(
+            client=client,
+            logger=logger,
+            state=state,
+            position=active_position,
+            schedule=schedule,
+            twap_config=twap_config,
+            min_sell_price=min_sell_price,
+        )
+
+        if sold:
+            sleep_after_processed_date(target_date, logger, poll_interval_seconds)
+        else:
+            time.sleep(poll_interval_seconds)
+        return
+
+    target_date = resolve_target_market_date(schedule.buy_day_offset)
+    buy_order_key = build_buy_order_key(target_date, schedule, target_outcome)
+
+    if is_order_key_processed(state, buy_order_key):
+        log_json(
+            logger,
+            "buy_skipped_already_processed",
+            {
+                "order_key": buy_order_key,
+                "target_outcome": target_outcome,
+            },
+        )
+        sleep_after_processed_date(target_date, logger, poll_interval_seconds)
+        return
+
+    trade_times = build_trade_times_record(target_date, schedule)
+    log_json(
+        logger,
+        "trade_times_scheduled",
+        {
+            "schedule": build_schedule_record(schedule),
+            "target_outcome": target_outcome,
+            "target_date": target_date,
+            "trade_times": trade_times,
+        },
+    )
+
+    buy_time = build_randomized_trade_time_utc(
+        target_date=target_date,
+        day_offset=schedule.buy_day_offset,
+        hour_utc=schedule.buy_hour_utc,
+        side=BUY_SIDE,
+        random_window_seconds=schedule.trade_time_random_window_seconds,
+    )
+
+    if not wait_for_buy_window(buy_time, snapshot_grace_seconds, logger):
+        mark_order_key_processed(
+            state=state,
+            order_key=buy_order_key,
+            status="buy_window_missed",
+            payload={
+                "buy_time": buy_time.isoformat(),
+                "schedule": build_schedule_record(schedule),
+                "target_outcome": target_outcome,
+                "target_date": target_date,
+            },
+        )
+        sleep_after_processed_date(target_date, logger, poll_interval_seconds)
+        return
+
+    executed = execute_buy_twap(
+        client=client,
+        logger=logger,
+        state=state,
+        target_date=target_date,
+        target_outcome=target_outcome,
+        schedule=schedule,
+        twap_config=twap_config,
+        buy_amount_usdc=buy_amount_usdc,
+        max_buy_price=max_buy_price,
+    )
+
+    if not executed:
+        time.sleep(poll_interval_seconds)
 
 
 def run_forever() -> None:
     load_env_file()
     logger = build_logger()
     validate_confirmation()
-    config = build_strategy_config()
-    client = build_client()
-    state = build_initial_state()
+
+    target_outcome = get_target_outcome_env()
+    schedule = build_trade_schedule()
+    twap_config = build_twap_config()
+    buy_amount_usdc = get_float_env(BUY_AMOUNT_ENV)
+    max_buy_price = get_probability_env(MAX_BUY_PRICE_ENV, DEFAULT_MAX_BUY_PRICE)
+    min_sell_price = get_probability_env(MIN_SELL_PRICE_ENV, DEFAULT_MIN_SELL_PRICE)
+    poll_interval_seconds = get_int_env(
+        POLL_INTERVAL_SECONDS_ENV,
+        DEFAULT_POLL_INTERVAL_SECONDS,
+    )
+    snapshot_grace_seconds = get_int_env(
+        SNAPSHOT_GRACE_SECONDS_ENV,
+        DEFAULT_SNAPSHOT_GRACE_SECONDS,
+    )
+
+    validate_buy_amount(buy_amount_usdc)
+    validate_twap_buy_amount(buy_amount_usdc, twap_config)
+    validate_positive_seconds(POLL_INTERVAL_SECONDS_ENV, poll_interval_seconds)
+    validate_positive_seconds(SNAPSHOT_GRACE_SECONDS_ENV, snapshot_grace_seconds)
 
     log_json(
         logger,
-        "strategy_started",
+        "script_started",
         {
-            "entry_price_threshold": config.entry_price_threshold,
-            "force_exit_min_sell_price": decimal_price_to_log(
-                config.force_exit_min_sell_price
-            ),
-            "limit_order_prices": [
-                decimal_price_to_log(price)
-                for price in config.limit_order_prices
-            ],
-            "low_exit_price": config.low_exit_price,
-            "low_exit_seconds": config.low_exit_seconds,
-            "market_refresh_interval_seconds": config.market_refresh_interval_seconds,
-            "max_entry_markets_per_event": config.max_entry_markets_per_event,
-            "order_size_shares": config.order_size_shares,
-            "poll_interval_seconds": config.poll_interval_seconds,
-            "take_profit_price": config.take_profit_price,
+            "buy_amount_usdc": buy_amount_usdc,
+            "market_rank": TARGET_MARKET_RANK,
+            "max_buy_price": max_buy_price,
+            "min_sell_price": min_sell_price,
+            "poll_interval_seconds": poll_interval_seconds,
+            "schedule": build_schedule_record(schedule),
+            "snapshot_grace_seconds": snapshot_grace_seconds,
+            "target_outcome": target_outcome,
+            "twap": build_twap_config_record(twap_config),
         },
     )
 
+    client = build_client()
+    state = load_state()
+
     while True:
         try:
-            run_price_cycle(client, logger, state, config)
+            run_trade_cycle(
+                client=client,
+                logger=logger,
+                state=state,
+                target_outcome=target_outcome,
+                schedule=schedule,
+                twap_config=twap_config,
+                buy_amount_usdc=buy_amount_usdc,
+                max_buy_price=max_buy_price,
+                min_sell_price=min_sell_price,
+                snapshot_grace_seconds=snapshot_grace_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
         except KeyboardInterrupt:
             raise
         except Exception as error:
             logger.exception("cycle_error %s", error)
-
-        sleep_until_next_cycle(config.poll_interval_seconds)
+            time.sleep(poll_interval_seconds)
 
 
 if __name__ == "__main__":
