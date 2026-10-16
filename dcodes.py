@@ -9,7 +9,7 @@ from datetime import datetime
 import time
 import random
 
-# v.18
+# v.19
 
 # Constants
 DISCORD_LOGIN_URL = 'https://discord.com/login'
@@ -22,7 +22,14 @@ MESSAGE_ARTICLE_SELECTOR = 'div[role="article"][data-list-item-id^="chat-message
 AUTHOR_ID_PREFIX = 'message-username-'
 AUTHOR_NAME_SELECTOR = 'span[role="button"][data-text]'
 ADD_REACTION_SELECTOR = '[role="button"][aria-label="Add Reaction"]'
-EMOJI_SEARCH_SELECTOR = 'input[aria-controls="emoji-picker-grid"]'
+SUPER_REACTION_TOGGLE_SELECTOR = (
+    '#emoji-picker-tab-panel[role="dialog"] '
+    '[role="button"][aria-label$="Super Reactions"][aria-pressed]'
+)
+SUPER_REACTION_ENABLED_SELECTOR = f'{SUPER_REACTION_TOGGLE_SELECTOR}[aria-pressed="true"]'
+EMOJI_SEARCH_SELECTOR = (
+    '#emoji-picker-tab-panel[role="dialog"] input[aria-controls="emoji-picker-grid"]'
+)
 REACTION_WAIT_TIMEOUT_SECONDS = 30
 
 # Log file for links where recent message authors could not be fully checked
@@ -172,9 +179,27 @@ def find_and_react_to_most_recent_message(driver, username_keyword, emojis):
             log_with_timestamp("Clicked on add reaction")
             random_sleep()
 
-            emoji_input = WebDriverWait(driver, REACTION_WAIT_TIMEOUT_SECONDS).until(
+            picker_wait = WebDriverWait(driver, REACTION_WAIT_TIMEOUT_SECONDS)
+            super_reaction_toggle = picker_wait.until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, SUPER_REACTION_TOGGLE_SELECTOR)),
+                message="The Super Reaction toggle did not become available in the reaction picker.",
+            )
+            super_reaction_state = super_reaction_toggle.get_attribute('aria-pressed')
+            if super_reaction_state == 'false':
+                super_reaction_toggle.click()
+            elif super_reaction_state != 'true':
+                raise ValueError(f"Unrecognized Super Reaction toggle state: {super_reaction_state!r}")
+
+            picker_wait.until(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, SUPER_REACTION_ENABLED_SELECTOR)),
+                message="Super Reactions could not be confirmed enabled; the reaction was not submitted.",
+            )
+            log_with_timestamp("Super Reactions are enabled")
+            random_sleep()
+
+            emoji_input = picker_wait.until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, EMOJI_SEARCH_SELECTOR)),
-                message="The emoji search input did not become clickable after Add Reaction.",
+                message="The emoji search input did not become clickable after enabling Super Reactions.",
             )
             emoji_input.click()
             log_with_timestamp("Clicked on emoji search input")
@@ -183,8 +208,12 @@ def find_and_react_to_most_recent_message(driver, username_keyword, emojis):
             emoji = random.choice(emojis)
             emoji_input.send_keys(emoji)
             random_sleep()
+            picker_wait.until(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, SUPER_REACTION_ENABLED_SELECTOR)),
+                message="Super Reactions were not enabled before submission; the reaction was not submitted.",
+            )
             emoji_input.send_keys(Keys.ENTER)
-            log_with_timestamp(f"Submitted reaction with emoji '{emoji}'")
+            log_with_timestamp(f"Submitted Super Reaction with emoji '{emoji}'")
             return
         log_with_timestamp(f"No recent message found from user containing '{username_keyword}'")
     except Exception as e:
@@ -196,7 +225,7 @@ def main():
         options = Options()
         options.add_argument('--headless')
         options.add_argument('--disable-gpu')
-        options.add_argument('window-size=1920x1080')  # Optional but recommended
+        options.add_argument('window-size=1920,1080')  # Optional but recommended
         driver = webdriver.Chrome(options=options)
 
         login_to_discord(driver, E_MAIL, PASSWORD)
