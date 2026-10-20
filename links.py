@@ -1,4 +1,4 @@
-# v.49 MESSAGE_LINKS
+# v.50 MESSAGE_LINKS
 
 MESSAGE_LINKS = [
     # Hyperliquid
@@ -26,7 +26,7 @@ MESSAGE_LINKS = [
     # Hylo
     ('https://discord.com/channels/1369249501453352980/1395423800358863039', 'Invite code: U52KS7 \n\nLink: https://hylo.so/r/U52KS7', [':yum:', ':relaxed:'], True),
     # Arcus
-    ('https://discord.com/channels/1499372212585627739/1555120199156506624', '+$100m volume \n\nReferral code: GABEN \n\nLink: https://app.arcus.xyz/ref/GABEN', [':yum:', ':relaxed:'], True),
+    ('https://discord.com/channels/1499372212585627739/1555120199156506624', '+$100m volume \n\nReferral code: GABEN \n\nLink: app.arcus.xyz/ref/GABEN', [':yum:', ':relaxed:'], True),
     # Add more links as needed, (channel link, message, emoji list, react flag)
 
 ]
